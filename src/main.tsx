@@ -261,6 +261,19 @@ function Workspace({ role }: { role: Role }) {
           <button className="ghost" onClick={refreshAll} title="Refresh">
             <RefreshCw />
           </button>
+          {role === "owner" && (
+            <button
+              className="ghost"
+              onClick={() =>
+                api<{ description: string }>("/api/admin/telegram-webhook", { method: "POST", body: "{}" })
+                  .then((data) => setNotice(data.description || "Telegram webhook is set"))
+                  .catch(showError(setNotice))
+              }
+              title="Set Telegram webhook"
+            >
+              <Bot />
+            </button>
+          )}
         </header>
 
         {notice && <p className="notice">{notice}</p>}

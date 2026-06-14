@@ -58,6 +58,11 @@ async function route(context: ApiContext): Promise<Response> {
     return json({ role: session.role });
   }
 
+  if (parts[0] === "admin" && parts[1] === "telegram-webhook" && method === "POST") {
+    requireOwner(session);
+    return setTelegramWebhook(request, env);
+  }
+
   if (parts[0] === "folders") {
     if (method === "GET") return listFolders(env.DB);
     if (method === "POST") return createFolder(request, env.DB, session);
@@ -509,6 +514,22 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
 
   await telegramSend(env, userId, "Пока я сохраняю только текстовые заметки и фото.");
   return json({ ok: true });
+}
+
+async function setTelegramWebhook(request: Request, env: Env): Promise<Response> {
+  if (!env.TELEGRAM_BOT_TOKEN) return json({ error: "TELEGRAM_BOT_TOKEN is not configured" }, 500);
+  const origin = new URL(request.url).origin;
+  const webhookUrl = `${origin}/api/telegram/webhook`;
+  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url: webhookUrl }),
+  });
+  const data = (await response.json()) as { ok?: boolean; description?: string };
+  if (!response.ok || !data.ok) {
+    return json({ error: data.description || "Telegram webhook setup failed" }, 502);
+  }
+  return json({ ok: true, webhookUrl, description: data.description || "Webhook was set" });
 }
 
 async function handleTelegramCallback(env: Env, callback: TelegramCallbackQuery, userId: string): Promise<void> {
