@@ -7,7 +7,7 @@
     {
       "binding": "DB",
       "database_name": "retelling_brain_bot",
-      "database_id": "replace-with-cloudflare-d1-database-id",
+      "database_id": "bb2b4b2c-0755-4027-8bfa-a9d3ed96fc96",
       "migrations_dir": "./migrations"
     }
   ],
