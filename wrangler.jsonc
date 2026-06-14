@@ -1,0 +1,20 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "retelling-brain-bot",
+  "compatibility_date": "2026-06-13",
+  "pages_build_output_dir": "dist",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "retelling_brain_bot",
+      "database_id": "replace-with-cloudflare-d1-database-id",
+      "migrations_dir": "./migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "PHOTOS",
+      "bucket_name": "retelling-brain-photos"
+    }
+  ]
+}
