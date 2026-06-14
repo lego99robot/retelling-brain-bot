@@ -495,7 +495,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
 
   if (message.text) {
     const content = cleanContent(message.text, NOTE_LIMIT);
-    const draftId = crypto.randomUUID();
+    const draftId = telegramDraftId();
     await env.DB.prepare("INSERT INTO telegram_drafts (id, telegram_user_id, kind, text_content) VALUES (?, ?, 'text', ?)").bind(draftId, String(userId), content).run();
     await sendFolderPicker(env, userId, draftId);
     return json({ ok: true });
@@ -503,7 +503,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
 
   if (message.photo?.length) {
     const chosen = chooseTelegramPhoto(message.photo);
-    const draftId = crypto.randomUUID();
+    const draftId = telegramDraftId();
     await env.DB
       .prepare("INSERT INTO telegram_drafts (id, telegram_user_id, kind, telegram_file_id, width, height) VALUES (?, ?, 'photo', ?, ?, ?)")
       .bind(draftId, String(userId), chosen.file_id, chosen.width, chosen.height)
@@ -537,13 +537,21 @@ async function handleTelegramCallback(env: Env, callback: TelegramCallbackQuery,
   const [kind, draftId, selectedId] = data.split(":");
 
   if (kind === "folder" && draftId && selectedId) {
+    await telegramAnswerCallback(env, callback.id, "Папка выбрана. Теперь выберите тему.");
     const topics = await env.DB.prepare("SELECT id, name FROM topics WHERE folder_id = ? ORDER BY created_at ASC").bind(selectedId).all<{ id: string; name: string }>();
-    const rows = (topics.results || []).map((topic) => [{ text: topic.name, callback_data: `topic:${draftId}:${topic.id}` }]);
-    await telegramEdit(env, callback.message.chat.id, callback.message.message_id, "Теперь выберите тему:", rows);
+    const rows = (topics.results || []).map((topic) => [{ text: `Сохранить в тему: ${topic.name}`, callback_data: `topic:${draftId}:${topic.id}` }]);
+    await telegramEdit(
+      env,
+      callback.message.chat.id,
+      callback.message.message_id,
+      "Шаг 2 из 2. Нажмите тему, куда сохранить заметку:",
+      rows,
+    );
     return;
   }
 
   if (kind === "topic" && draftId && selectedId) {
+    await telegramAnswerCallback(env, callback.id, "Сохраняю...");
     const draft = await env.DB.prepare("SELECT * FROM telegram_drafts WHERE id = ? AND telegram_user_id = ?").bind(draftId, userId).first<TelegramDraft>();
     if (!draft) {
       await telegramSend(env, callback.message.chat.id, "Черновик не найден или устарел.");
@@ -563,14 +571,15 @@ async function handleTelegramCallback(env: Env, callback: TelegramCallbackQuery,
 
     await env.DB.prepare("DELETE FROM telegram_drafts WHERE id = ?").bind(draftId).run();
     await touchTopic(env.DB, selectedId);
-    await telegramEdit(env, callback.message.chat.id, callback.message.message_id, "Сохранено в выбранную тему.", []);
+    const topic = await env.DB.prepare("SELECT name FROM topics WHERE id = ?").bind(selectedId).first<{ name: string }>();
+    await telegramEdit(env, callback.message.chat.id, callback.message.message_id, `Готово. Сохранено в тему: ${topic?.name || "выбранная тема"}.`, []);
   }
 }
 
 async function sendFolderPicker(env: Env, chatId: number, draftId: string): Promise<void> {
   const folders = await env.DB.prepare("SELECT id, name FROM folders ORDER BY created_at ASC").all<{ id: string; name: string }>();
-  const rows = (folders.results || []).map((folder) => [{ text: folder.name, callback_data: `folder:${draftId}:${folder.id}` }]);
-  await telegramSend(env, chatId, "Выберите папку:", rows);
+  const rows = (folders.results || []).map((folder) => [{ text: `Папка: ${folder.name}`, callback_data: `folder:${draftId}:${folder.id}` }]);
+  await telegramSend(env, chatId, "Шаг 1 из 2. Нажмите папку, куда сохранить заметку:", rows);
 }
 
 async function saveTelegramPhoto(env: Env, topicId: string, fileId: string): Promise<void> {
@@ -659,6 +668,19 @@ async function telegramEdit(
   });
 }
 
+async function telegramAnswerCallback(env: Env, callbackQueryId: string, text: string): Promise<void> {
+  if (!env.TELEGRAM_BOT_TOKEN) return;
+  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      callback_query_id: callbackQueryId,
+      text,
+      show_alert: false,
+    }),
+  });
+}
+
 function isAllowedTelegramUser(env: Env, userId: number): boolean {
   return String(userId) === String(env.OWNER_TELEGRAM_ID) || String(userId) === String(env.TEACHER_TELEGRAM_ID || "126041348");
 }
@@ -704,6 +726,10 @@ function safeFilename(value: string): string {
 
 function slug(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+}
+
+function telegramDraftId(): string {
+  return crypto.randomUUID().replace(/-/g, "").slice(0, 16);
 }
 
 async function readJson<T>(request: Request): Promise<T> {
