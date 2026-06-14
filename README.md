@@ -7,7 +7,7 @@ Telegram-first MVP for saving English retelling notes and compressed photos, the
 - React + Vite + TypeScript frontend on Cloudflare Pages.
 - Cloudflare Pages Functions backend.
 - Cloudflare D1 for folders, topics, notes, comments, AI limits and cache.
-- Cloudflare R2 for compressed photo files.
+- Cloudflare R2 for compressed photo files when R2 is enabled. Without R2, Telegram photos are stored by Telegram file id and served through the backend.
 - OpenRouter for explicit text-only AI actions.
 
 ## Local Setup
@@ -41,7 +41,7 @@ Telegram-first MVP for saving English retelling notes and compressed photos, the
 ## Cloudflare Setup Notes
 
 - Replace `database_id` in `wrangler.jsonc` after creating the D1 database.
-- Create an R2 bucket named `retelling-brain-photos` or change `bucket_name`.
+- Optional for full photo support: enable R2 and add a bucket named `retelling-brain-photos`. Without R2, Telegram photo capture still works, but web-panel photo uploads return a storage-not-configured message.
 - Set secrets in Cloudflare Pages:
   - `TELEGRAM_BOT_TOKEN`
   - `OWNER_TELEGRAM_ID`

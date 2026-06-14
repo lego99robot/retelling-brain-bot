@@ -10,11 +10,5 @@
       "database_id": "bb2b4b2c-0755-4027-8bfa-a9d3ed96fc96",
       "migrations_dir": "./migrations"
     }
-  ],
-  "r2_buckets": [
-    {
-      "binding": "PHOTOS",
-      "bucket_name": "retelling-brain-photos"
-    }
   ]
 }

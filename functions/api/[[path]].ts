@@ -1,6 +1,6 @@
 export interface Env {
   DB: D1Database;
-  PHOTOS: R2Bucket;
+  PHOTOS?: R2Bucket;
   TELEGRAM_BOT_TOKEN?: string;
   OWNER_TELEGRAM_ID?: string;
   TEACHER_TELEGRAM_ID?: string;
@@ -266,6 +266,9 @@ async function updateNote(request: Request, db: D1Database, session: Session, no
 
 async function createPhoto(request: Request, env: Env, session: Session): Promise<Response> {
   requireOwner(session);
+  if (!env.PHOTOS) {
+    return json({ error: "Photo storage is not configured. Enable R2 to upload photos from the web panel." }, 503);
+  }
   const form = await request.formData();
   const topicId = String(form.get("topicId") || "");
   const description = String(form.get("description") || "").trim().slice(0, NOTE_LIMIT);
@@ -308,6 +311,10 @@ async function updatePhoto(request: Request, db: D1Database, session: Session, p
 async function getPhotoFile(env: Env, photoId: string): Promise<Response> {
   const photo = await env.DB.prepare("SELECT r2_key, content_type FROM photos WHERE id = ?").bind(photoId).first<{ r2_key: string; content_type: string }>();
   if (!photo) return json({ error: "Photo not found" }, 404);
+  if (photo.r2_key.startsWith("telegram:")) {
+    return getTelegramPhotoFile(env, photo.r2_key.slice("telegram:".length));
+  }
+  if (!env.PHOTOS) return json({ error: "Photo storage is not configured" }, 503);
   const object = await env.PHOTOS.get(photo.r2_key);
   if (!object) return json({ error: "Photo file not found" }, 404);
   return new Response(object.body, {
@@ -546,16 +553,20 @@ async function sendFolderPicker(env: Env, chatId: number, draftId: string): Prom
 }
 
 async function saveTelegramPhoto(env: Env, topicId: string, fileId: string): Promise<void> {
-  if (!env.TELEGRAM_BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is not configured");
-  const fileResponse = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
-  const fileData = (await fileResponse.json()) as { ok: boolean; result?: { file_path?: string } };
-  const filePath = fileData.result?.file_path;
-  if (!fileData.ok || !filePath) throw new Error("Telegram getFile failed");
-
-  const imageResponse = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`);
-  if (!imageResponse.ok) throw new Error("Telegram photo download failed");
-  const bytes = await imageResponse.arrayBuffer();
   const id = crypto.randomUUID();
+
+  if (!env.PHOTOS) {
+    await env.DB
+      .prepare(
+        `INSERT INTO photos (id, topic_id, r2_key, filename, content_type, size_bytes, description, tags_json)
+         VALUES (?, ?, ?, ?, 'image/jpeg', 0, '', '[]')`,
+      )
+      .bind(id, topicId, `telegram:${fileId}`, `${id}.jpg`)
+      .run();
+    return;
+  }
+
+  const bytes = await downloadTelegramPhoto(env, fileId);
   const r2Key = `photos/${topicId}/${id}.jpg`;
   await env.PHOTOS.put(r2Key, bytes, { httpMetadata: { contentType: "image/jpeg" } });
   await env.DB
@@ -565,6 +576,28 @@ async function saveTelegramPhoto(env: Env, topicId: string, fileId: string): Pro
     )
     .bind(id, topicId, r2Key, `${id}.jpg`, bytes.byteLength)
     .run();
+}
+
+async function getTelegramPhotoFile(env: Env, fileId: string): Promise<Response> {
+  const bytes = await downloadTelegramPhoto(env, fileId);
+  return new Response(bytes, {
+    headers: {
+      "Content-Type": "image/jpeg",
+      "Cache-Control": "private, max-age=300",
+    },
+  });
+}
+
+async function downloadTelegramPhoto(env: Env, fileId: string): Promise<ArrayBuffer> {
+  if (!env.TELEGRAM_BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is not configured");
+  const fileResponse = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(fileId)}`);
+  const fileData = (await fileResponse.json()) as { ok: boolean; result?: { file_path?: string } };
+  const filePath = fileData.result?.file_path;
+  if (!fileData.ok || !filePath) throw new Error("Telegram getFile failed");
+
+  const imageResponse = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`);
+  if (!imageResponse.ok) throw new Error("Telegram photo download failed");
+  return imageResponse.arrayBuffer();
 }
 
 function chooseTelegramPhoto(photos: TelegramPhotoSize[]): TelegramPhotoSize {
