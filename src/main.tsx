@@ -9,6 +9,7 @@ import {
   FolderPlus,
   Image,
   Lock,
+  LogOut,
   MessageSquare,
   PenLine,
   Plus,
@@ -108,7 +109,7 @@ function App() {
   }
 
   if (!role) return <Login onLogin={setRole} />;
-  return <Workspace role={role} />;
+  return <Workspace role={role} onLogout={() => setRole(null)} />;
 }
 
 function Login({ onLogin }: { onLogin: (role: Role) => void }) {
@@ -178,7 +179,7 @@ function Login({ onLogin }: { onLogin: (role: Role) => void }) {
   );
 }
 
-function Workspace({ role }: { role: Role }) {
+function Workspace({ role, onLogout }: { role: Role; onLogout: () => void }) {
   const [folders, setFolders] = useState<FolderRow[]>([]);
   const [topics, setTopics] = useState<TopicRow[]>([]);
   const [feed, setFeed] = useState<TopicFeed | null>(null);
@@ -234,6 +235,14 @@ function Workspace({ role }: { role: Role }) {
     if (selectedTopicId) await loadFeed(selectedTopicId);
   }
 
+  async function logout() {
+    try {
+      await api<{ ok: boolean }>("/api/auth/logout", { method: "POST", body: "{}" });
+    } finally {
+      onLogout();
+    }
+  }
+
   return (
     <main className="workspace">
       <aside className="folders-column">
@@ -242,7 +251,12 @@ function Workspace({ role }: { role: Role }) {
             <Brain />
             <span>Retelling Brain</span>
           </div>
-          <span className="role-pill">{role}</span>
+          <div className="session-actions">
+            <span className="role-pill">{role}</span>
+            <button className="ghost compact-button" onClick={logout} title="Log out">
+              <LogOut />
+            </button>
+          </div>
         </header>
         <CreateFolder disabled={role !== "owner"} onCreated={loadFolders} />
         <nav className="folder-list" aria-label="Folders">

@@ -5,6 +5,7 @@ export interface Env {
   OWNER_TELEGRAM_ID?: string;
   TEACHER_TELEGRAM_ID?: string;
   WEB_PASSWORD?: string;
+  WEB_PASSWORD_TEATH?: string;
   OPENROUTER_API_KEY?: string;
   OPENROUTER_MODEL?: string;
 }
@@ -59,6 +60,10 @@ async function route(context: ApiContext): Promise<Response> {
     return login(request, env);
   }
 
+  if (parts[0] === "auth" && parts[1] === "logout" && method === "POST") {
+    return logout(request);
+  }
+
   const session = await requireSession(request, env);
   await ensureDefaults(env.DB);
 
@@ -107,12 +112,20 @@ async function route(context: ApiContext): Promise<Response> {
 
 async function login(request: Request, env: Env): Promise<Response> {
   const body = await readJson<{ password?: string; role?: Role }>(request);
-  if (!env.WEB_PASSWORD) return json({ error: "WEB_PASSWORD is not configured" }, 500);
-  if (!body.password || body.password !== env.WEB_PASSWORD) return json({ error: "Invalid password" }, 401);
-
   const role: Role = body.role === "teacher" ? "teacher" : "owner";
+  if (!env.WEB_PASSWORD) return json({ error: "WEB_PASSWORD is not configured" }, 500);
+  const expectedPassword = role === "teacher" ? env.WEB_PASSWORD_TEATH || env.WEB_PASSWORD : env.WEB_PASSWORD;
+  if (!body.password || body.password !== expectedPassword) return json({ error: "Invalid password" }, 401);
+
   const cookie = await createSessionCookie(env, role, request.url);
   return json({ role }, 200, { "Set-Cookie": cookie });
+}
+
+function logout(request: Request): Response {
+  const secure = new URL(request.url).protocol === "https:" ? " Secure;" : "";
+  return json({ ok: true }, 200, {
+    "Set-Cookie": `rb_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax;${secure}`,
+  });
 }
 
 async function requireSession(request: Request, env: Env): Promise<Session> {
