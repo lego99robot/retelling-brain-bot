@@ -517,6 +517,38 @@ textarea:focus {
   gap: 8px;
 }
 
+.block-summary {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbf8f0;
+}
+
+.block-summary textarea {
+  min-height: 86px;
+}
+
+.block-summary p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.block-summary button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 38px;
+  border-radius: 8px;
+  background: var(--sage-dark);
+  color: white;
+  font-weight: 800;
+}
+
 .photo-grid img {
   width: 100%;
   aspect-ratio: 1;

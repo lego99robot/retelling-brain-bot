@@ -18,6 +18,14 @@ const AI_DAILY_LIMIT = 10;
 const NOTE_LIMIT = 1000;
 const MAX_WEB_PHOTO_BYTES = 3 * 1024 * 1024;
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const NOTE_TYPES = [
+  { id: "plot", label: "Plot", tag: "#сюжет" },
+  { id: "words", label: "Words", tag: "#words" },
+  { id: "facts", label: "Facts", tag: "#facts" },
+  { id: "names", label: "Names", tag: "#names" },
+  { id: "opinion", label: "Opinion", tag: "#opinion" },
+  { id: "retelling", label: "Retelling", tag: "#retelling" },
+] as const;
 
 export const onRequest: PagesFunction<Env> = async (context) => {
   try {
@@ -71,6 +79,7 @@ async function route(context: ApiContext): Promise<Response> {
   if (parts[0] === "topics") {
     if (method === "GET" && parts.length === 1) return listTopics(request, env.DB);
     if (method === "POST" && parts.length === 1) return createTopic(request, env.DB, session);
+    if (method === "PATCH" && parts[1] && parts.length === 2) return updateTopic(request, env.DB, session, parts[1]);
     if (method === "GET" && parts[2] === "feed") return getTopicFeed(env, parts[1]);
   }
 
@@ -211,6 +220,21 @@ async function createTopic(request: Request, db: D1Database, session: Session): 
   return json({ id, folder_id: body.folderId, name }, 201);
 }
 
+async function updateTopic(request: Request, db: D1Database, session: Session, topicId: string): Promise<Response> {
+  requireOwner(session);
+  const body = await readJson<{ name?: string; summary?: string }>(request);
+  const existing = await db.prepare("SELECT id, name, summary FROM topics WHERE id = ?").bind(topicId).first<{ id: string; name: string; summary: string }>();
+  if (!existing) return json({ error: "Study block not found" }, 404);
+
+  const name = body.name === undefined ? existing.name : cleanName(body.name, 60);
+  const summary = body.summary === undefined ? existing.summary : String(body.summary || "").trim().slice(0, 600);
+  await db
+    .prepare("UPDATE topics SET name = ?, summary = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    .bind(name, summary, topicId)
+    .run();
+  return json({ ok: true, id: topicId, name, summary });
+}
+
 async function getTopicFeed(env: Env, topicId: string): Promise<Response> {
   const topic = await env.DB
     .prepare(
@@ -219,7 +243,7 @@ async function getTopicFeed(env: Env, topicId: string): Promise<Response> {
     )
     .bind(topicId)
     .first();
-  if (!topic) return json({ error: "Topic not found" }, 404);
+  if (!topic) return json({ error: "Study block not found" }, 404);
 
   const [notes, photos, comments] = await Promise.all([
     env.DB.prepare("SELECT * FROM notes WHERE topic_id = ? ORDER BY created_at DESC").bind(topicId).all(),
@@ -354,11 +378,11 @@ async function runTopicAiAction(request: Request, env: Env, session: Session): P
   if (!action) return json({ error: "Unknown AI action" }, 400);
 
   const context = await buildTopicContext(env.DB, body.topicId);
-  if (!context.topicName) return json({ error: "Topic not found" }, 404);
+  if (!context.topicName) return json({ error: "Study block not found" }, 404);
   if (context.text.trim().length < 40) {
     return json({
       cached: false,
-      response: "Данных недостаточно: в текущей теме слишком мало сохраненных заметок или описаний фото. Добавьте 2-3 короткие заметки о сюжете, героях, фактах или своем мнении.",
+      response: "Данных недостаточно: в текущем учебном блоке слишком мало сохраненных заметок или описаний фото. Добавьте 2-3 короткие заметки о сюжете, героях, фактах или своем мнении.",
     });
   }
 
@@ -484,7 +508,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
   if (!message) return json({ ok: true });
 
   if (message.text?.startsWith("/start")) {
-    await telegramSend(env, userId, "Retelling Brain Bot готов. Отправьте заметку или фото, затем выберите папку и тему.");
+    await telegramSend(env, userId, "Retelling Brain Bot готов. Отправьте заметку или фото, затем выберите папку, учебный блок и тип заметки.");
     return json({ ok: true });
   }
 
@@ -494,9 +518,15 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
   }
 
   if (message.text) {
+    const handledPendingName = await handlePendingStudyBlockName(env, String(userId), message.chat.id, message.text);
+    if (handledPendingName) return json({ ok: true });
+
     const content = cleanContent(message.text, NOTE_LIMIT);
     const draftId = telegramDraftId();
-    await env.DB.prepare("INSERT INTO telegram_drafts (id, telegram_user_id, kind, text_content) VALUES (?, ?, 'text', ?)").bind(draftId, String(userId), content).run();
+    await env.DB
+      .prepare("INSERT INTO telegram_drafts (id, telegram_user_id, kind, text_content, pending_step) VALUES (?, ?, 'text', ?, 'folder')")
+      .bind(draftId, String(userId), content)
+      .run();
     await sendFolderPicker(env, userId, draftId);
     return json({ ok: true });
   }
@@ -505,7 +535,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
     const chosen = chooseTelegramPhoto(message.photo);
     const draftId = telegramDraftId();
     await env.DB
-      .prepare("INSERT INTO telegram_drafts (id, telegram_user_id, kind, telegram_file_id, width, height) VALUES (?, ?, 'photo', ?, ?, ?)")
+      .prepare("INSERT INTO telegram_drafts (id, telegram_user_id, kind, telegram_file_id, width, height, pending_step) VALUES (?, ?, 'photo', ?, ?, ?, 'folder')")
       .bind(draftId, String(userId), chosen.file_id, chosen.width, chosen.height)
       .run();
     await sendFolderPicker(env, userId, draftId);
@@ -535,6 +565,70 @@ async function setTelegramWebhook(request: Request, env: Env): Promise<Response>
 async function handleTelegramCallback(env: Env, callback: TelegramCallbackQuery, userId: string): Promise<void> {
   const data = callback.data || "";
   const [kind, draftId, selectedId] = data.split(":");
+
+  if (kind === "folder" && draftId && selectedId) {
+    const draft = await getTelegramDraft(env, draftId, userId);
+    if (!draft) {
+      await telegramAnswerCallback(env, callback.id, "Черновик не найден.");
+      return;
+    }
+    await env.DB
+      .prepare("UPDATE telegram_drafts SET selected_folder_id = ?, pending_step = 'topic' WHERE id = ? AND telegram_user_id = ?")
+      .bind(selectedId, draftId, userId)
+      .run();
+    await telegramAnswerCallback(env, callback.id, "Папка выбрана.");
+    await sendStudyBlockPicker(env, callback.message.chat.id, callback.message.message_id, draftId, selectedId);
+    return;
+  }
+
+  if (kind === "topic" && draftId && selectedId) {
+    const draft = await getTelegramDraft(env, draftId, userId);
+    if (!draft) {
+      await telegramAnswerCallback(env, callback.id, "Черновик не найден.");
+      return;
+    }
+    await env.DB
+      .prepare("UPDATE telegram_drafts SET selected_topic_id = ?, pending_step = 'type' WHERE id = ? AND telegram_user_id = ?")
+      .bind(selectedId, draftId, userId)
+      .run();
+    await telegramAnswerCallback(env, callback.id, "Учебный блок выбран.");
+    await sendNoteTypePicker(env, callback.message.chat.id, callback.message.message_id, draftId);
+    return;
+  }
+
+  if (kind === "newtopic" && draftId) {
+    const draft = await getTelegramDraft(env, draftId, userId);
+    if (!draft?.selected_folder_id) {
+      await telegramAnswerCallback(env, callback.id, "Сначала выберите папку.");
+      return;
+    }
+    await env.DB.prepare("UPDATE telegram_drafts SET pending_step = 'new_topic' WHERE id = ? AND telegram_user_id = ?").bind(draftId, userId).run();
+    await telegramAnswerCallback(env, callback.id, "Жду название.");
+    await telegramEdit(
+      env,
+      callback.message.chat.id,
+      callback.message.message_id,
+      "Отправьте название нового учебного блока одним сообщением. Например: Harry Potter — Chapter 1",
+      [],
+    );
+    return;
+  }
+
+  if (kind === "type" && draftId && selectedId) {
+    const draft = await getTelegramDraft(env, draftId, userId);
+    const noteType = getNoteType(selectedId);
+    if (!draft?.selected_topic_id || !noteType) {
+      await telegramAnswerCallback(env, callback.id, "Не хватает данных для сохранения.");
+      return;
+    }
+    await telegramAnswerCallback(env, callback.id, "Сохраняю...");
+    await saveDraftAsStudyMaterial(env, draft, noteType.tag);
+    await env.DB.prepare("UPDATE telegram_drafts SET note_type = ? WHERE id = ?").bind(noteType.id, draftId).run();
+    await env.DB.prepare("DELETE FROM telegram_drafts WHERE id = ?").bind(draftId).run();
+    const topic = await env.DB.prepare("SELECT name FROM topics WHERE id = ?").bind(draft.selected_topic_id).first<{ name: string }>();
+    await telegramEdit(env, callback.message.chat.id, callback.message.message_id, `Готово. Сохранено в Study block: ${studyBlockDisplayName(topic?.name || "General")} · ${noteType.label}.`, []);
+    return;
+  }
 
   if (kind === "folder" && draftId && selectedId) {
     await telegramAnswerCallback(env, callback.id, "Папка выбрана. Теперь выберите тему.");
@@ -576,22 +670,95 @@ async function handleTelegramCallback(env: Env, callback: TelegramCallbackQuery,
   }
 }
 
+async function sendStudyBlockPicker(env: Env, chatId: number | string, messageId: number, draftId: string, folderId: string): Promise<void> {
+  const topics = await env.DB.prepare("SELECT id, name FROM topics WHERE folder_id = ? ORDER BY created_at ASC").bind(folderId).all<{ id: string; name: string }>();
+  const rows = (topics.results || []).map((topic) => [{ text: `Study block: ${studyBlockDisplayName(topic.name)}`, callback_data: `topic:${draftId}:${topic.id}` }]);
+  rows.push([{ text: "+ Create new study block", callback_data: `newtopic:${draftId}` }]);
+  await telegramEdit(env, chatId, messageId, "Шаг 2 из 3. Выберите учебный блок:", rows);
+}
+
+async function sendNoteTypePicker(env: Env, chatId: number | string, messageId: number, draftId: string): Promise<void> {
+  await telegramEdit(env, chatId, messageId, "Шаг 3 из 3. Выберите тип заметки:", noteTypeKeyboard(draftId));
+}
+
+async function handlePendingStudyBlockName(env: Env, userId: string, chatId: number, rawName: string): Promise<boolean> {
+  const draft = await env.DB
+    .prepare(
+      `SELECT * FROM telegram_drafts
+       WHERE telegram_user_id = ? AND pending_step = 'new_topic'
+       ORDER BY created_at DESC LIMIT 1`,
+    )
+    .bind(userId)
+    .first<TelegramDraft>();
+  if (!draft?.selected_folder_id) return false;
+
+  const name = cleanName(rawName, 60);
+  const topicId = crypto.randomUUID();
+  await env.DB.prepare("INSERT INTO topics (id, folder_id, name) VALUES (?, ?, ?)").bind(topicId, draft.selected_folder_id, name).run();
+  await env.DB
+    .prepare("UPDATE telegram_drafts SET selected_topic_id = ?, pending_step = 'type' WHERE id = ? AND telegram_user_id = ?")
+    .bind(topicId, draft.id, userId)
+    .run();
+  await telegramSend(env, chatId, `Учебный блок создан: ${studyBlockDisplayName(name)}. Теперь выберите тип заметки:`, noteTypeKeyboard(draft.id));
+  return true;
+}
+
+async function saveDraftAsStudyMaterial(env: Env, draft: TelegramDraft, typeTag: string): Promise<void> {
+  if (!draft.selected_topic_id) throw new Error("Missing selected study block");
+
+  if (draft.kind === "text" && draft.text_content) {
+    const content = withTypeTag(draft.text_content, typeTag);
+    await env.DB
+      .prepare("INSERT INTO notes (id, topic_id, author_role, content, tags_json) VALUES (?, ?, 'owner', ?, ?)")
+      .bind(crypto.randomUUID(), draft.selected_topic_id, content, JSON.stringify(extractTags(content)))
+      .run();
+  }
+
+  if (draft.kind === "photo" && draft.telegram_file_id) {
+    await saveTelegramPhoto(env, draft.selected_topic_id, draft.telegram_file_id, typeTag);
+  }
+
+  await touchTopic(env.DB, draft.selected_topic_id);
+}
+
+async function getTelegramDraft(env: Env, draftId: string, userId: string): Promise<TelegramDraft | null> {
+  return env.DB.prepare("SELECT * FROM telegram_drafts WHERE id = ? AND telegram_user_id = ?").bind(draftId, userId).first<TelegramDraft>();
+}
+
+function noteTypeKeyboard(draftId: string): Array<Array<{ text: string; callback_data: string }>> {
+  return NOTE_TYPES.map((type) => [{ text: `Type: ${type.label}`, callback_data: `type:${draftId}:${type.id}` }]);
+}
+
+function getNoteType(id: string): (typeof NOTE_TYPES)[number] | undefined {
+  return NOTE_TYPES.find((type) => type.id === id);
+}
+
+function withTypeTag(content: string, tag: string): string {
+  const tags = extractTags(content);
+  return tags.includes(tag.toLowerCase()) ? content : `${tag} ${content}`;
+}
+
+function studyBlockDisplayName(name: string): string {
+  return name.trim().toLowerCase() === "general" ? "General study block" : name;
+}
+
 async function sendFolderPicker(env: Env, chatId: number, draftId: string): Promise<void> {
   const folders = await env.DB.prepare("SELECT id, name FROM folders ORDER BY created_at ASC").all<{ id: string; name: string }>();
   const rows = (folders.results || []).map((folder) => [{ text: `Папка: ${folder.name}`, callback_data: `folder:${draftId}:${folder.id}` }]);
-  await telegramSend(env, chatId, "Шаг 1 из 2. Нажмите папку, куда сохранить заметку:", rows);
+  await telegramSend(env, chatId, "Шаг 1 из 3. Куда сохранить?", rows);
 }
 
-async function saveTelegramPhoto(env: Env, topicId: string, fileId: string): Promise<void> {
+async function saveTelegramPhoto(env: Env, topicId: string, fileId: string, description = ""): Promise<void> {
   const id = crypto.randomUUID();
+  const tagsJson = JSON.stringify(extractTags(description));
 
   if (!env.PHOTOS) {
     await env.DB
       .prepare(
         `INSERT INTO photos (id, topic_id, r2_key, filename, content_type, size_bytes, description, tags_json)
-         VALUES (?, ?, ?, ?, 'image/jpeg', 0, '', '[]')`,
+         VALUES (?, ?, ?, ?, 'image/jpeg', 0, ?, ?)`,
       )
-      .bind(id, topicId, `telegram:${fileId}`, `${id}.jpg`)
+      .bind(id, topicId, `telegram:${fileId}`, `${id}.jpg`, description, tagsJson)
       .run();
     return;
   }
@@ -602,9 +769,9 @@ async function saveTelegramPhoto(env: Env, topicId: string, fileId: string): Pro
   await env.DB
     .prepare(
       `INSERT INTO photos (id, topic_id, r2_key, filename, content_type, size_bytes, description, tags_json)
-       VALUES (?, ?, ?, ?, 'image/jpeg', ?, '', '[]')`,
+       VALUES (?, ?, ?, ?, 'image/jpeg', ?, ?, ?)`,
     )
-    .bind(id, topicId, r2Key, `${id}.jpg`, bytes.byteLength)
+    .bind(id, topicId, r2Key, `${id}.jpg`, bytes.byteLength, description, tagsJson)
     .run();
 }
 
@@ -827,4 +994,8 @@ interface TelegramDraft {
   kind: "text" | "photo";
   text_content?: string;
   telegram_file_id?: string;
+  selected_folder_id?: string;
+  selected_topic_id?: string;
+  pending_step?: string;
+  note_type?: string;
 }

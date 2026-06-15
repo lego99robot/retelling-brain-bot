@@ -83,6 +83,10 @@ const AI_ACTIONS = [
   { id: "extract", label: "Extract", title: "Слова, имена, факты" },
 ];
 
+function studyBlockName(name?: string): string {
+  return (name || "").trim().toLowerCase() === "general" ? "General study block" : name || "";
+}
+
 function App() {
   const [role, setRole] = useState<Role | null>(null);
   const [loadingSession, setLoadingSession] = useState(true);
@@ -139,7 +143,7 @@ function Login({ onLogin }: { onLogin: (role: Role) => void }) {
         </div>
         <h1>Your quiet archive for English retelling practice.</h1>
         <p>
-          Telegram captures fast notes and photos. This panel keeps the second brain tidy: folders, topics,
+          Telegram captures fast notes and photos. This panel keeps the second brain tidy: folders, study blocks,
           teacher comments, and AI actions only when you ask.
         </p>
       </section>
@@ -205,6 +209,9 @@ function Workspace({ role }: { role: Role }) {
 
   useEffect(() => {
     if (!selectedFolderId) return;
+    setTopics([]);
+    setFeed(null);
+    setSelectedTopicId("");
     loadTopics(selectedFolderId, true).catch(showError(setNotice));
   }, [selectedFolderId]);
 
@@ -215,6 +222,11 @@ function Workspace({ role }: { role: Role }) {
 
   const selectedFolder = folders.find((folder) => folder.id === selectedFolderId);
   const selectedTopic = topics.find((topic) => topic.id === selectedTopicId);
+
+  function selectTopic(topicId: string) {
+    setFeed(null);
+    setSelectedTopicId(topicId);
+  }
 
   async function refreshAll() {
     await loadFolders();
@@ -244,7 +256,7 @@ function Workspace({ role }: { role: Role }) {
               <span>
                 <strong>{folder.name}</strong>
                 <small>
-                  {folder.topic_count} topics · {folder.note_count} notes · {folder.photo_count} photos
+                  {folder.topic_count} study blocks · {folder.note_count} notes · {folder.photo_count} photos
                 </small>
               </span>
             </button>
@@ -256,7 +268,7 @@ function Workspace({ role }: { role: Role }) {
         <header className="toolbar">
           <div>
             <p className="eyebrow">{selectedFolder?.name || "Folder"}</p>
-            <h1>{feed?.topic.name || selectedTopic?.name || "Choose a topic"}</h1>
+            <h1>{studyBlockName(feed?.topic.name || selectedTopic?.name) || "Choose a study block"}</h1>
           </div>
           <button className="ghost" onClick={refreshAll} title="Refresh">
             <RefreshCw />
@@ -283,14 +295,14 @@ function Workspace({ role }: { role: Role }) {
           topics={topics}
           selectedTopicId={selectedTopicId}
           folderId={selectedFolderId}
-          onSelect={setSelectedTopicId}
+          onSelect={selectTopic}
           onCreated={() => loadTopics(selectedFolderId, true)}
         />
 
         {feed && (
           <>
             <Composer role={role} topicId={feed.topic.id} onSaved={refreshAll} />
-            <AiPanel topicId={feed.topic.id} disabled={role !== "owner"} />
+            <AiPanel key={feed.topic.id} topicId={feed.topic.id} disabled={role !== "owner"} />
             <FeedStream feed={feed} role={role} onChanged={refreshAll} />
           </>
         )}
@@ -359,7 +371,7 @@ function TopicTabs({
       <div className="topic-tabs">
         {topics.map((topic) => (
           <button key={topic.id} className={topic.id === selectedTopicId ? "active" : ""} onClick={() => onSelect(topic.id)}>
-            {topic.name}
+            {studyBlockName(topic.name)}
           </button>
         ))}
       </div>
@@ -367,10 +379,10 @@ function TopicTabs({
         <input
           value={name}
           onChange={(event) => setName(event.target.value)}
-          placeholder={role === "owner" ? "New topic" : "Owner can add topics"}
+          placeholder={role === "owner" ? "New study block" : "Owner can add study blocks"}
           disabled={role !== "owner"}
         />
-        <button disabled={role !== "owner" || !name.trim()} title="Add topic">
+        <button disabled={role !== "owner" || !name.trim()} title="Add study block">
           <Plus />
         </button>
       </form>
@@ -419,7 +431,7 @@ function Composer({ role, topicId, onSaved }: { role: Role; topicId: string; onS
     return (
       <section className="composer readonly">
         <MessageSquare />
-        <span>Teacher mode: add feedback in the topic card.</span>
+        <span>Teacher mode: add feedback in the study block card.</span>
       </section>
     );
   }
@@ -469,6 +481,11 @@ function AiPanel({ topicId, disabled }: { topicId: string; disabled: boolean }) 
   const [output, setOutput] = useState("");
   const [busyAction, setBusyAction] = useState("");
 
+  useEffect(() => {
+    setOutput("");
+    setBusyAction("");
+  }, [topicId]);
+
   async function run(action: string) {
     setBusyAction(action);
     setOutput("");
@@ -489,7 +506,7 @@ function AiPanel({ topicId, disabled }: { topicId: string; disabled: boolean }) 
     <section className="ai-panel">
       <div className="ai-head">
         <Sparkles />
-        <span>AI actions by current topic only</span>
+        <span>AI uses only this study block</span>
       </div>
       <div className="ai-actions">
         {AI_ACTIONS.map((action) => (
@@ -518,7 +535,7 @@ function FeedStream({ feed, role, onChanged }: { feed: TopicFeed; role: Role; on
     return (
       <section className="empty-stream">
         <FileText />
-        <p>No notes yet. Send a Telegram message or add one here.</p>
+        <p>No notes yet. Send a Telegram message or add one to this study block.</p>
       </section>
     );
   }
@@ -614,6 +631,12 @@ function PhotoItem({ photo, role, onChanged }: { photo: PhotoRow; role: Role; on
 
 function TopicCard({ feed, role, onChanged }: { feed: TopicFeed; role: Role; onChanged: () => Promise<void> }) {
   const [comment, setComment] = useState("");
+  const [summary, setSummary] = useState(feed.topic.summary || "");
+  const displayName = studyBlockName(feed.topic.name);
+
+  useEffect(() => {
+    setSummary(feed.topic.summary || "");
+  }, [feed.topic.id, feed.topic.summary]);
 
   async function addComment(event: React.FormEvent) {
     event.preventDefault();
@@ -626,16 +649,41 @@ function TopicCard({ feed, role, onChanged }: { feed: TopicFeed; role: Role; onC
     await onChanged();
   }
 
+  async function saveBlock(event: React.FormEvent) {
+    event.preventDefault();
+    await api(`/api/topics/${feed.topic.id}`, { method: "PATCH", body: JSON.stringify({ summary }) });
+    await onChanged();
+  }
+
   return (
     <section className="topic-card">
-      <p className="eyebrow">{feed.topic.folder_name}</p>
-      <h2>{feed.topic.name}</h2>
+      <p className="eyebrow">{feed.topic.folder_name} / {displayName}</p>
+      <h2>{displayName}</h2>
       <div className="metrics">
         <span>{feed.notes.length} notes</span>
         <span>{feed.photos.length} photos</span>
         <span>{feed.comments.length} comments</span>
       </div>
       <TagLine tags={feed.tags} />
+
+      <form className="block-summary" onSubmit={saveBlock}>
+        <label>
+          <span>What this block is about</span>
+          <textarea
+            value={summary}
+            onChange={(event) => setSummary(event.target.value.slice(0, 600))}
+            placeholder="Chapter, scene, lesson, video fragment, or word group..."
+            disabled={role !== "owner"}
+          />
+        </label>
+        <p>AI uses only notes and manual photo descriptions from this study block.</p>
+        {role === "owner" && (
+          <button disabled={summary === (feed.topic.summary || "")}>
+            <CheckCircle2 />
+            Save block
+          </button>
+        )}
+      </form>
 
       <div className="photo-grid">
         {feed.photos.map((photo) => (
@@ -670,8 +718,8 @@ function EmptyTopicCard() {
   return (
     <section className="topic-card empty">
       <Brain />
-      <h2>Choose a topic</h2>
-      <p>The right side will collect photos, tags and teacher feedback for the current theme.</p>
+      <h2>Choose a study block</h2>
+      <p>The right side will collect photos, tags and teacher feedback for the current block.</p>
     </section>
   );
 }
