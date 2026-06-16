@@ -20,6 +20,7 @@ const NOTE_LIMIT = 1000;
 const MAX_WEB_PHOTO_BYTES = 3 * 1024 * 1024;
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const NOTE_TYPES = [
+  { id: "photo", label: "Photo", tag: "#photo" },
   { id: "plot", label: "Plot", tag: "#сюжет" },
   { id: "words", label: "Words", tag: "#words" },
   { id: "facts", label: "Facts", tag: "#facts" },
@@ -530,6 +531,11 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
     return json({ ok: true });
   }
 
+  if (message.text && /^фото$/iu.test(message.text.trim())) {
+    await telegramSend(env, userId, "Отправьте само изображение через кнопку 📎 / Фото. Тогда я сохраню его как фото и спрошу папку, учебный блок и тип.");
+    return json({ ok: true });
+  }
+
   if (message.text) {
     const handledPendingName = await handlePendingStudyBlockName(env, String(userId), message.chat.id, message.text);
     if (handledPendingName) return json({ ok: true });
@@ -548,8 +554,18 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
     const chosen = chooseTelegramPhoto(message.photo);
     const draftId = telegramDraftId();
     await env.DB
-      .prepare("INSERT INTO telegram_drafts (id, telegram_user_id, kind, telegram_file_id, width, height, pending_step) VALUES (?, ?, 'photo', ?, ?, ?, 'folder')")
-      .bind(draftId, String(userId), chosen.file_id, chosen.width, chosen.height)
+      .prepare("INSERT INTO telegram_drafts (id, telegram_user_id, kind, text_content, telegram_file_id, width, height, pending_step) VALUES (?, ?, 'photo', ?, ?, ?, ?, 'folder')")
+      .bind(draftId, String(userId), String(message.caption || "").trim().slice(0, NOTE_LIMIT), chosen.file_id, chosen.width, chosen.height)
+      .run();
+    await sendFolderPicker(env, userId, draftId);
+    return json({ ok: true });
+  }
+
+  if (message.document?.mime_type?.startsWith("image/")) {
+    const draftId = telegramDraftId();
+    await env.DB
+      .prepare("INSERT INTO telegram_drafts (id, telegram_user_id, kind, text_content, telegram_file_id, width, height, pending_step) VALUES (?, ?, 'photo', ?, ?, ?, ?, 'folder')")
+      .bind(draftId, String(userId), String(message.caption || "").trim().slice(0, NOTE_LIMIT), message.document.file_id, null, null)
       .run();
     await sendFolderPicker(env, userId, draftId);
     return json({ ok: true });
@@ -728,7 +744,7 @@ async function saveDraftAsStudyMaterial(env: Env, draft: TelegramDraft, typeTag:
   }
 
   if (draft.kind === "photo" && draft.telegram_file_id) {
-    await saveTelegramPhoto(env, draft.selected_topic_id, draft.telegram_file_id, typeTag);
+    await saveTelegramPhoto(env, draft.selected_topic_id, draft.telegram_file_id, withTypeTag(draft.text_content || "", typeTag));
   }
 
   await touchTopic(env.DB, draft.selected_topic_id);
@@ -748,7 +764,9 @@ function getNoteType(id: string): (typeof NOTE_TYPES)[number] | undefined {
 
 function withTypeTag(content: string, tag: string): string {
   const tags = extractTags(content);
-  return tags.includes(tag.toLowerCase()) ? content : `${tag} ${content}`;
+  if (tags.includes(tag.toLowerCase())) return content;
+  const trimmed = content.trim();
+  return trimmed ? `${tag} ${trimmed}` : tag;
 }
 
 function studyBlockDisplayName(name: string): string {
@@ -982,7 +1000,14 @@ interface TelegramMessage {
   from?: { id: number };
   chat: { id: number };
   text?: string;
+  caption?: string;
   photo?: TelegramPhotoSize[];
+  document?: {
+    file_id: string;
+    file_name?: string;
+    mime_type?: string;
+    file_size?: number;
+  };
 }
 
 interface TelegramPhotoSize {
