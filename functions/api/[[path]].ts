@@ -13,6 +13,7 @@ export interface Env {
 type Role = "owner" | "teacher";
 type Session = { role: Role };
 type ApiContext = EventContext<Env, string, unknown>;
+type AiContext = { topicName: string; text: string; fingerprint: string };
 
 const DEFAULT_FOLDERS = ["Books", "Films", "Videos", "Vocabulary", "Inbox"] as const;
 const AI_DAILY_LIMIT = 10;
@@ -430,7 +431,7 @@ async function runTopicAiAction(request: Request, env: Env, session: Session): P
   return json({ cached: false, response });
 }
 
-async function buildTopicContext(db: D1Database, topicId: string): Promise<{ topicName: string; text: string; fingerprint: string }> {
+async function buildTopicContext(db: D1Database, topicId: string): Promise<AiContext> {
   const topic = await db.prepare("SELECT name FROM topics WHERE id = ?").bind(topicId).first<{ name: string }>();
   if (!topic) return { topicName: "", text: "", fingerprint: "" };
   const notes = await db.prepare("SELECT id, content, updated_at FROM notes WHERE topic_id = ? ORDER BY created_at ASC").bind(topicId).all();
@@ -444,10 +445,40 @@ async function buildTopicContext(db: D1Database, topicId: string): Promise<{ top
   return { topicName: topic.name, text: textParts.join("\n"), fingerprint };
 }
 
-async function callOpenRouter(env: Env, action: string, topicContext: { topicName: string; text: string }): Promise<string> {
+async function buildFolderContext(db: D1Database, folderId: string): Promise<AiContext> {
+  const folder = await db.prepare("SELECT id, name FROM folders WHERE id = ?").bind(folderId).first<{ id: string; name: string }>();
+  if (!folder) return { topicName: "", text: "", fingerprint: "" };
+  const notes = await db
+    .prepare(
+      `SELECT t.name AS topic_name, n.id, n.content, n.updated_at
+       FROM notes n JOIN topics t ON t.id = n.topic_id
+       WHERE t.folder_id = ?
+       ORDER BY t.created_at ASC, n.created_at ASC`,
+    )
+    .bind(folderId)
+    .all<{ topic_name: string; id: string; content: string; updated_at: string }>();
+  const photos = await db
+    .prepare(
+      `SELECT t.name AS topic_name, p.id, p.description, p.updated_at
+       FROM photos p JOIN topics t ON t.id = p.topic_id
+       WHERE t.folder_id = ? AND p.description <> ''
+       ORDER BY t.created_at ASC, p.created_at ASC`,
+    )
+    .bind(folderId)
+    .all<{ topic_name: string; id: string; description: string; updated_at: string }>();
+  const textParts = [
+    `Folder: ${folder.name}`,
+    ...(notes.results || []).map((note) => `Study block "${note.topic_name}" note: ${note.content}`),
+    ...(photos.results || []).map((photo) => `Study block "${photo.topic_name}" photo description: ${photo.description}`),
+  ];
+  const fingerprint = JSON.stringify({ folder, notes: notes.results, photos: photos.results });
+  return { topicName: folder.name, text: textParts.join("\n").slice(0, 12000), fingerprint };
+}
+
+async function callOpenRouter(env: Env, action: string, topicContext: AiContext, languageInstruction = ""): Promise<string> {
   if (!env.OPENROUTER_API_KEY) throw httpError(500, "OPENROUTER_API_KEY is not configured");
   const model = env.OPENROUTER_MODEL || "nvidia/nemotron-3-ultra-550b-a55b:free";
-  const prompt = aiInstruction(action);
+  const prompt = `${aiInstruction(action)}${languageInstruction ? `\n${languageInstruction}` : ""}`;
   const response = await fetch(OPENROUTER_URL, {
     method: "POST",
     headers: {
@@ -505,6 +536,92 @@ function aiInstruction(action: string): string {
   return map[action] || map.short;
 }
 
+async function handleTelegramAiTextRequest(env: Env, chatId: number, text: string): Promise<boolean> {
+  const action = inferAiAction(text);
+  if (!action) return false;
+  const folderId = await inferFolderId(env.DB, text);
+  if (!folderId) {
+    await telegramSend(env, chatId, "Я понял AI-запрос, но не понял папку. Напишите, например: \"Сделай короткое описание по папке Books на английском\".");
+    return true;
+  }
+
+  const context = await buildFolderContext(env.DB, folderId);
+  if (!context.topicName) {
+    await telegramSend(env, chatId, "Папка не найдена. Проверьте название папки в веб-панели.");
+    return true;
+  }
+  if (context.text.trim().length < 40) {
+    await telegramSend(env, chatId, "Данных недостаточно: в этой папке мало сохраненных заметок или описаний фото. Добавьте несколько заметок в нужные Study blocks.");
+    return true;
+  }
+
+  const usageDate = new Date().toISOString().slice(0, 10);
+  const usage = await env.DB
+    .prepare("SELECT count FROM ai_usage WHERE usage_date = ? AND user_key = ?")
+    .bind(usageDate, "owner")
+    .first<{ count: number }>();
+  if ((usage?.count || 0) >= AI_DAILY_LIMIT) {
+    await telegramSend(env, chatId, "Дневной лимит AI-запросов достигнут. Попробуйте завтра.");
+    return true;
+  }
+
+  await telegramSend(env, chatId, "Готовлю ответ по сохраненной информации...");
+  try {
+    const response = await callOpenRouter(env, action, context, inferLanguageInstruction(text));
+    await env.DB
+      .prepare(
+        `INSERT INTO ai_usage (usage_date, user_key, count) VALUES (?, ?, 1)
+         ON CONFLICT(usage_date, user_key) DO UPDATE SET count = count + 1`,
+      )
+      .bind(usageDate, "owner")
+      .run();
+    await telegramSendLong(env, chatId, response);
+  } catch (error) {
+    console.error("Telegram AI request failed", error);
+    await telegramSend(env, chatId, "OpenRouter сейчас не ответил. Обычное сохранение заметок и фото продолжает работать.");
+  }
+  return true;
+}
+
+function inferAiAction(text: string): string | null {
+  const normalized = text.toLowerCase();
+  if (/\ba2\b|а2|уровн[яю]\s*a2/.test(normalized)) return "a2";
+  if (/\bb1\b|в1|b 1|уровн[яю]\s*b1/.test(normalized)) return "b1";
+  if (/план|plan/.test(normalized)) return "plan";
+  if (/задан|упражнен|повторен|tasks?/.test(normalized)) return "tasks";
+  if (/extract|выдел|слова|имена|факты/.test(normalized)) return "extract";
+  if (/коротк|кратк|short|описан|summary|пересказ/.test(normalized)) return "short";
+  return null;
+}
+
+async function inferFolderId(db: D1Database, text: string): Promise<string | null> {
+  const normalized = text.toLowerCase();
+  const aliases: Array<[string[], string]> = [
+    [["book", "books", "книга", "книги", "книге", "папке книга"], "Books"],
+    [["film", "films", "movie", "movies", "фильм", "фильмы", "кино"], "Films"],
+    [["video", "videos", "видео", "ролик"], "Videos"],
+    [["vocabulary", "words", "слова", "словар", "лексика"], "Vocabulary"],
+    [["inbox", "инбокс", "входящие"], "Inbox"],
+  ];
+  for (const [words, folderName] of aliases) {
+    if (words.some((word) => normalized.includes(word))) {
+      const folder = await db.prepare("SELECT id FROM folders WHERE lower(name) = lower(?)").bind(folderName).first<{ id: string }>();
+      if (folder) return folder.id;
+    }
+  }
+
+  const folders = await db.prepare("SELECT id, name FROM folders ORDER BY created_at ASC").all<{ id: string; name: string }>();
+  const matched = (folders.results || []).find((folder) => normalized.includes(folder.name.toLowerCase()));
+  return matched?.id || null;
+}
+
+function inferLanguageInstruction(text: string): string {
+  const normalized = text.toLowerCase();
+  if (/английск|english|in english/.test(normalized)) return "Answer in English.";
+  if (/русск|russian|по-русски/.test(normalized)) return "Answer in Russian.";
+  return "";
+}
+
 async function handleTelegramWebhook(request: Request, env: Env): Promise<Response> {
   const update = (await request.json()) as TelegramUpdate;
   const userId = getTelegramUserId(update);
@@ -539,6 +656,9 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
   if (message.text) {
     const handledPendingName = await handlePendingStudyBlockName(env, String(userId), message.chat.id, message.text);
     if (handledPendingName) return json({ ok: true });
+
+    const handledAiRequest = await handleTelegramAiTextRequest(env, message.chat.id, message.text);
+    if (handledAiRequest) return json({ ok: true });
 
     const content = cleanContent(message.text, NOTE_LIMIT);
     const draftId = telegramDraftId();
@@ -844,6 +964,21 @@ async function telegramSend(env: Env, chatId: number | string, text: string, key
       reply_markup: keyboard?.length ? { inline_keyboard: keyboard } : undefined,
     }),
   });
+}
+
+async function telegramSendLong(env: Env, chatId: number | string, text: string): Promise<void> {
+  const limit = 3800;
+  const chunks: string[] = [];
+  let remaining = text.trim();
+  while (remaining.length > limit) {
+    const cutAt = Math.max(remaining.lastIndexOf("\n", limit), remaining.lastIndexOf(". ", limit), limit);
+    chunks.push(remaining.slice(0, cutAt).trim());
+    remaining = remaining.slice(cutAt).trim();
+  }
+  if (remaining) chunks.push(remaining);
+  for (const chunk of chunks) {
+    await telegramSend(env, chatId, chunk);
+  }
 }
 
 async function telegramEdit(
