@@ -47,8 +47,18 @@ Telegram-first MVP for saving English retelling notes and compressed photos, the
   - `OWNER_TELEGRAM_ID`
   - `TEACHER_TELEGRAM_ID`
   - `WEB_PASSWORD`
+  - `WEB_PASSWORD_TEATH`
   - `OPENROUTER_API_KEY`
   - `OPENROUTER_MODEL`
+
+## Pre-RAG Memory Rules
+
+- For books, use `Books` as the folder and one study block per chapter, for example `Harry Potter - Chapter 1`.
+- Use `topics.summary` as the short chapter description.
+- Use note tags for information type: `#plot`, `#words`, `#facts`, `#names`, `#opinion`, `#retelling`, `#photo`.
+- Future vector chunks should be small semantic pieces from text notes and manual photo descriptions only.
+- Future chunk metadata should include `folder`, `book`, `studyBlock/chapter`, `noteType`, `tags`, and `createdAt`.
+- Do not index or analyze raw photos until a separate vision feature is added.
 
 ## Telegram Webhook
 

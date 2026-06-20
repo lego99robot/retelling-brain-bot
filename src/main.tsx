@@ -88,6 +88,48 @@ function studyBlockName(name?: string): string {
   return (name || "").trim().toLowerCase() === "general" ? "General study block" : name || "";
 }
 
+interface ChapterInsightSection {
+  title: string;
+  items: string[];
+  empty: string;
+}
+
+function buildChapterInsights(feed: TopicFeed): { updatedAt: string; sections: ChapterInsightSection[] } {
+  const sections: ChapterInsightSection[] = [
+    { title: "Plot notes", items: taggedFeedItems(feed, ["#plot", "#сюжет"]), empty: "No plot notes yet." },
+    { title: "Key facts", items: taggedFeedItems(feed, ["#facts"]), empty: "No facts yet." },
+    { title: "Characters / names", items: taggedFeedItems(feed, ["#names"]), empty: "No names yet." },
+    { title: "New words", items: taggedFeedItems(feed, ["#words"]), empty: "No words yet." },
+    { title: "Personal opinion", items: taggedFeedItems(feed, ["#opinion"]), empty: "No opinion yet." },
+    { title: "A2 / B1 retelling", items: taggedFeedItems(feed, ["#retelling"]), empty: "No saved retelling yet." },
+  ];
+  return { updatedAt: latestFeedDate(feed), sections };
+}
+
+function taggedFeedItems(feed: TopicFeed, wantedTags: string[]): string[] {
+  const wanted = new Set(wantedTags.map((tag) => tag.toLowerCase()));
+  const noteItems = feed.notes
+    .filter((note) => parseTags(note.tags_json).some((tag) => wanted.has(tag)))
+    .map((note) => cleanInsightText(note.content));
+  const photoItems = feed.photos
+    .filter((photo) => photo.description && parseTags(photo.tags_json).some((tag) => wanted.has(tag)))
+    .map((photo) => cleanInsightText(photo.description));
+  return [...noteItems, ...photoItems].filter(Boolean).slice(0, 3);
+}
+
+function cleanInsightText(value: string): string {
+  const text = value.replace(/#[\p{L}\p{N}_-]+/gu, "").trim();
+  return text.length > 120 ? `${text.slice(0, 117).trim()}...` : text;
+}
+
+function latestFeedDate(feed: TopicFeed): string {
+  const dates = [...feed.notes.map((note) => note.created_at), ...feed.photos.map((photo) => photo.created_at), ...feed.comments.map((comment) => comment.created_at)]
+    .map((value) => new Date(value).getTime())
+    .filter((value) => Number.isFinite(value));
+  if (!dates.length) return "No updates yet";
+  return new Date(Math.max(...dates)).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+}
+
 function App() {
   const [role, setRole] = useState<Role | null>(null);
   const [loadingSession, setLoadingSession] = useState(true);
@@ -647,6 +689,7 @@ function TopicCard({ feed, role, onChanged }: { feed: TopicFeed; role: Role; onC
   const [comment, setComment] = useState("");
   const [summary, setSummary] = useState(feed.topic.summary || "");
   const displayName = studyBlockName(feed.topic.name);
+  const chapterInsights = useMemo(() => buildChapterInsights(feed), [feed]);
 
   useEffect(() => {
     setSummary(feed.topic.summary || "");
@@ -698,6 +741,29 @@ function TopicCard({ feed, role, onChanged }: { feed: TopicFeed; role: Role; onC
           </button>
         )}
       </form>
+
+      <section className="chapter-card">
+        <div className="chapter-card-header">
+          <span>Chapter card</span>
+          <small>Updated {chapterInsights.updatedAt}</small>
+        </div>
+        <div className="chapter-insights">
+          {chapterInsights.sections.map((section) => (
+            <article key={section.title}>
+              <h3>{section.title}</h3>
+              {section.items.length ? (
+                <ul>
+                  {section.items.map((item, index) => (
+                    <li key={`${section.title}-${index}`}>{item}</li>
+                  ))}
+                </ul>
+              ) : (
+                <p>{section.empty}</p>
+              )}
+            </article>
+          ))}
+        </div>
+      </section>
 
       <div className="photo-grid">
         {feed.photos.map((photo) => (

@@ -22,7 +22,7 @@ const MAX_WEB_PHOTO_BYTES = 3 * 1024 * 1024;
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const NOTE_TYPES = [
   { id: "photo", label: "Photo", tag: "#photo" },
-  { id: "plot", label: "Plot", tag: "#сюжет" },
+  { id: "plot", label: "Plot", tag: "#plot" },
   { id: "words", label: "Words", tag: "#words" },
   { id: "facts", label: "Facts", tag: "#facts" },
   { id: "names", label: "Names", tag: "#names" },
@@ -475,6 +475,17 @@ async function buildFolderContext(db: D1Database, folderId: string): Promise<AiC
   return { topicName: folder.name, text: textParts.join("\n").slice(0, 12000), fingerprint };
 }
 
+async function buildTopicsContext(db: D1Database, topics: Array<{ id: string; name: string }>, label: string): Promise<AiContext> {
+  if (!topics.length) return { topicName: "", text: "", fingerprint: "" };
+  const contexts = await Promise.all(topics.map((topic) => buildTopicContext(db, topic.id)));
+  const textParts = [`Selected study blocks: ${label}`];
+  for (const context of contexts) {
+    if (context.text.trim()) textParts.push(context.text);
+  }
+  const fingerprint = JSON.stringify({ label, topics, contexts: contexts.map((context) => context.fingerprint) });
+  return { topicName: label, text: textParts.join("\n\n").slice(0, 12000), fingerprint };
+}
+
 async function callOpenRouter(env: Env, action: string, topicContext: AiContext, languageInstruction = ""): Promise<string> {
   if (!env.OPENROUTER_API_KEY) throw httpError(500, "OPENROUTER_API_KEY is not configured");
   const model = env.OPENROUTER_MODEL || "nvidia/nemotron-3-ultra-550b-a55b:free";
@@ -539,19 +550,20 @@ function aiInstruction(action: string): string {
 async function handleTelegramAiTextRequest(env: Env, chatId: number, text: string): Promise<boolean> {
   const action = inferAiAction(text);
   if (!action) return false;
-  const folderId = await inferFolderId(env.DB, text);
-  if (!folderId) {
-    await telegramSend(env, chatId, "Я понял AI-запрос, но не понял папку. Напишите, например: \"Сделай короткое описание по папке Books на английском\".");
+
+  const scope = await inferTelegramAiScope(env.DB, text);
+  if ("message" in scope) {
+    await telegramSend(env, chatId, scope.message);
     return true;
   }
 
-  const context = await buildFolderContext(env.DB, folderId);
+  const context = scope.context;
   if (!context.topicName) {
-    await telegramSend(env, chatId, "Папка не найдена. Проверьте название папки в веб-панели.");
+    await telegramSend(env, chatId, "Не нашла подходящую папку или главу. Напишите, например: \"Сделай короткое описание по папке Books на английском\" или \"Сделай B1 пересказ по первой главе\".");
     return true;
   }
   if (context.text.trim().length < 40) {
-    await telegramSend(env, chatId, "Данных недостаточно: в этой папке мало сохраненных заметок или описаний фото. Добавьте несколько заметок в нужные Study blocks.");
+    await telegramSend(env, chatId, "Данных недостаточно: в выбранной папке или главе мало сохраненных заметок и ручных описаний фото. Добавьте несколько заметок с типами #plot, #facts, #names, #words или #retelling.");
     return true;
   }
 
@@ -592,6 +604,189 @@ function inferAiAction(text: string): string | null {
   if (/extract|выдел|слова|имена|факты/.test(normalized)) return "extract";
   if (/коротк|кратк|short|описан|summary|пересказ/.test(normalized)) return "short";
   return null;
+}
+
+type TelegramAiScope = { context: AiContext } | { message: string };
+
+async function inferTelegramAiScope(db: D1Database, text: string): Promise<TelegramAiScope> {
+  const booksFolder = await db.prepare("SELECT id, name FROM folders WHERE lower(name) = lower('Books')").first<{ id: string; name: string }>();
+  if (booksFolder && isBooksAiRequest(text)) {
+    const bookScope = await inferBooksAiScope(db, booksFolder, text);
+    if (bookScope) return bookScope;
+  }
+
+  const folderId = await inferFolderId(db, text);
+  if (!folderId) {
+    return {
+      message:
+        "Я понял AI-запрос, но не понял папку, книгу или главу. Напишите, например: \"Сделай короткое описание по папке Books на английском\" или \"Сделай B1 пересказ по первой главе\".",
+    };
+  }
+  return { context: await buildFolderContext(db, folderId) };
+}
+
+async function inferBooksAiScope(db: D1Database, booksFolder: { id: string; name: string }, text: string): Promise<TelegramAiScope | null> {
+  const topicsResult = await db
+    .prepare("SELECT id, name FROM topics WHERE folder_id = ? ORDER BY created_at ASC")
+    .bind(booksFolder.id)
+    .all<{ id: string; name: string }>();
+  const topics = topicsResult.results || [];
+  if (!topics.length) {
+    return { message: "В папке Books пока нет глав. Создайте Study block вроде \"Harry Potter — Chapter 1\" и добавьте заметки." };
+  }
+
+  const chapterRange = parseChapterRange(text);
+  const bookMatchedTopics = topics.filter((topic) => topicMatchesBookRequest(topic.name, text));
+  if (chapterRange) {
+    const chapterMatches = topics.filter((topic) => {
+      const chapterNumber = extractChapterNumber(topic.name);
+      return chapterNumber !== null && chapterNumber >= chapterRange.start && chapterNumber <= chapterRange.end;
+    });
+    const scopedMatches = bookMatchedTopics.length
+      ? chapterMatches.filter((topic) => bookMatchedTopics.some((matched) => matched.id === topic.id))
+      : chapterMatches;
+
+    if (!scopedMatches.length) {
+      return { message: `По глав${chapterRange.start === chapterRange.end ? "е" : "ам"} ${formatChapterRange(chapterRange)} данных нет. Создайте нужную главу в Books и добавьте заметки.` };
+    }
+
+    if (!bookMatchedTopics.length && hasAmbiguousBookChapters(scopedMatches)) {
+      const names = scopedMatches.map((topic) => studyBlockDisplayName(topic.name)).join(", ");
+      return { message: `Я нашла несколько похожих глав: ${names}. Уточните название книги в запросе.` };
+    }
+
+    return { context: await buildTopicsContext(db, scopedMatches, `Books / chapters ${formatChapterRange(chapterRange)}`) };
+  }
+
+  if (bookMatchedTopics.length) {
+    const label = `Books / ${bookTitleFromStudyBlock(bookMatchedTopics[0].name) || "selected book"}`;
+    return { context: await buildTopicsContext(db, bookMatchedTopics, label) };
+  }
+
+  return null;
+}
+
+function isBooksAiRequest(text: string): boolean {
+  const normalized = normalizeSearchText(text);
+  return (
+    /\b(book|books|chapter|chapters)\b/.test(normalized) ||
+    /книг|глав|поттер|гарри/.test(normalized) ||
+    parseChapterRange(text) !== null
+  );
+}
+
+function parseChapterRange(text: string): { start: number; end: number } | null {
+  const normalized = text.toLowerCase().replace(/ё/g, "е");
+  const range =
+    normalized.match(/(?:глав\p{L}*|chapter|chapters)\s*(\d+)\s*[-–—]\s*(\d+)/u) ||
+    normalized.match(/(\d+)\s*[-–—]\s*(\d+)\s*(?:глав\p{L}*|chapter|chapters)/u);
+  if (range) return normalizeRange(Number(range[1]), Number(range[2]));
+
+  const single = normalized.match(/(?:глав\p{L}*|chapter)\s*(\d+)/u);
+  if (single) return normalizeRange(Number(single[1]), Number(single[1]));
+
+  const ordinals: Array<[number, string[]]> = [
+    [1, ["первая", "первой", "первую", "первую"]],
+    [2, ["вторая", "второй", "вторую"]],
+    [3, ["третья", "третьей", "третью"]],
+    [4, ["четвертая", "четвертой", "четвертую"]],
+    [5, ["пятая", "пятой", "пятую"]],
+    [6, ["шестая", "шестой", "шестую"]],
+    [7, ["седьмая", "седьмой", "седьмую"]],
+    [8, ["восьмая", "восьмой", "восьмую"]],
+    [9, ["девятая", "девятой", "девятую"]],
+    [10, ["десятая", "десятой", "десятую"]],
+  ];
+  for (const [number, words] of ordinals) {
+    if (words.some((word) => normalized.includes(`${word} глав`))) return { start: number, end: number };
+  }
+  return null;
+}
+
+function normalizeRange(first: number, second: number): { start: number; end: number } | null {
+  if (!Number.isFinite(first) || !Number.isFinite(second) || first < 1 || second < 1) return null;
+  return { start: Math.min(first, second), end: Math.max(first, second) };
+}
+
+function extractChapterNumber(name: string): number | null {
+  const normalized = name.toLowerCase().replace(/ё/g, "е");
+  const match = normalized.match(/(?:chapter|глава)\s*(\d+)/u);
+  if (!match) return null;
+  const number = Number(match[1]);
+  return Number.isFinite(number) ? number : null;
+}
+
+function topicMatchesBookRequest(topicName: string, requestText: string): boolean {
+  const bookTitle = bookTitleFromStudyBlock(topicName);
+  const titleWords = normalizeSearchText(bookTitle)
+    .split(" ")
+    .filter((word) => word.length >= 4 && !["book", "chapter", "глава"].includes(word));
+  if (!titleWords.length) return false;
+  const request = normalizeSearchText(requestText);
+  const transliteratedRequest = normalizeSearchText(transliterateRussian(requestText));
+  return titleWords.some((word) => request.includes(word) || transliteratedRequest.includes(word));
+}
+
+function bookTitleFromStudyBlock(name: string): string {
+  return name
+    .replace(/\s*[-–—]\s*(chapter|глава)\s*\d+.*$/iu, "")
+    .replace(/\s*(chapter|глава)\s*\d+.*$/iu, "")
+    .trim();
+}
+
+function hasAmbiguousBookChapters(topics: Array<{ name: string }>): boolean {
+  const titles = new Set(topics.map((topic) => normalizeSearchText(bookTitleFromStudyBlock(topic.name))).filter(Boolean));
+  return titles.size > 1;
+}
+
+function formatChapterRange(range: { start: number; end: number }): string {
+  return range.start === range.end ? String(range.start) : `${range.start}-${range.end}`;
+}
+
+function normalizeSearchText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/ё/g, "е")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function transliterateRussian(value: string): string {
+  const map: Record<string, string> = {
+    а: "a",
+    б: "b",
+    в: "v",
+    г: "g",
+    д: "d",
+    е: "e",
+    ё: "e",
+    ж: "zh",
+    з: "z",
+    и: "i",
+    й: "y",
+    к: "k",
+    л: "l",
+    м: "m",
+    н: "n",
+    о: "o",
+    п: "p",
+    р: "r",
+    с: "s",
+    т: "t",
+    у: "u",
+    ф: "f",
+    х: "h",
+    ц: "ts",
+    ч: "ch",
+    ш: "sh",
+    щ: "sch",
+    ы: "y",
+    э: "e",
+    ю: "yu",
+    я: "ya",
+  };
+  return [...value.toLowerCase()].map((char) => map[char] || char).join("");
 }
 
 async function inferFolderId(db: D1Database, text: string): Promise<string | null> {
@@ -751,13 +946,17 @@ async function handleTelegramCallback(env: Env, callback: TelegramCallbackQuery,
       await telegramAnswerCallback(env, callback.id, "Сначала выберите папку.");
       return;
     }
+    const folder = await env.DB.prepare("SELECT name FROM folders WHERE id = ?").bind(draft.selected_folder_id).first<{ name: string }>();
+    const isBooks = isBooksFolderName(folder?.name || "");
     await env.DB.prepare("UPDATE telegram_drafts SET pending_step = 'new_topic' WHERE id = ? AND telegram_user_id = ?").bind(draftId, userId).run();
     await telegramAnswerCallback(env, callback.id, "Жду название.");
     await telegramEdit(
       env,
       callback.message.chat.id,
       callback.message.message_id,
-      "Отправьте название нового учебного блока одним сообщением. Например: Harry Potter — Chapter 1",
+      isBooks
+        ? "Отправьте название новой главы одним сообщением. Например: Harry Potter — Chapter 1"
+        : "Отправьте название нового учебного блока одним сообщением. Например: Lesson 1",
       [],
     );
     return;
@@ -774,8 +973,21 @@ async function handleTelegramCallback(env: Env, callback: TelegramCallbackQuery,
     await saveDraftAsStudyMaterial(env, draft, noteType.tag);
     await env.DB.prepare("UPDATE telegram_drafts SET note_type = ? WHERE id = ?").bind(noteType.id, draftId).run();
     await env.DB.prepare("DELETE FROM telegram_drafts WHERE id = ?").bind(draftId).run();
-    const topic = await env.DB.prepare("SELECT name FROM topics WHERE id = ?").bind(draft.selected_topic_id).first<{ name: string }>();
-    await telegramEdit(env, callback.message.chat.id, callback.message.message_id, `Готово. Сохранено в Study block: ${studyBlockDisplayName(topic?.name || "General")} · ${noteType.label}.`, []);
+    const topic = await env.DB
+      .prepare(
+        `SELECT t.name, f.name AS folder_name
+         FROM topics t JOIN folders f ON f.id = t.folder_id
+         WHERE t.id = ?`,
+      )
+      .bind(draft.selected_topic_id)
+      .first<{ name: string; folder_name: string }>();
+    await telegramEdit(
+      env,
+      callback.message.chat.id,
+      callback.message.message_id,
+      `Готово. Сохранено в ${isBooksFolderName(topic?.folder_name || "") ? "Chapter" : "Study block"}: ${studyBlockDisplayName(topic?.name || "General")} · ${noteType.label}.`,
+      [],
+    );
     return;
   }
 
@@ -820,14 +1032,34 @@ async function handleTelegramCallback(env: Env, callback: TelegramCallbackQuery,
 }
 
 async function sendStudyBlockPicker(env: Env, chatId: number | string, messageId: number, draftId: string, folderId: string): Promise<void> {
+  const folder = await env.DB.prepare("SELECT name FROM folders WHERE id = ?").bind(folderId).first<{ name: string }>();
   const topics = await env.DB.prepare("SELECT id, name FROM topics WHERE folder_id = ? ORDER BY created_at ASC").bind(folderId).all<{ id: string; name: string }>();
-  const rows = (topics.results || []).map((topic) => [{ text: `Study block: ${studyBlockDisplayName(topic.name)}`, callback_data: `topic:${draftId}:${topic.id}` }]);
-  rows.push([{ text: "+ Create new study block", callback_data: `newtopic:${draftId}` }]);
-  await telegramEdit(env, chatId, messageId, "Шаг 2 из 3. Выберите учебный блок:", rows);
+  const isBooks = isBooksFolderName(folder?.name || "");
+  const rows = (topics.results || []).map((topic) => [
+    { text: `${isBooks ? "Chapter" : "Study block"}: ${studyBlockDisplayName(topic.name)}`, callback_data: `topic:${draftId}:${topic.id}` },
+  ]);
+  rows.push([{ text: isBooks ? "+ Create new chapter" : "+ Create new study block", callback_data: `newtopic:${draftId}` }]);
+  await telegramEdit(
+    env,
+    chatId,
+    messageId,
+    isBooks ? "Шаг 2 из 3. Выберите главу / Study block:" : "Шаг 2 из 3. Выберите учебный блок:",
+    rows,
+  );
 }
 
 async function sendNoteTypePicker(env: Env, chatId: number | string, messageId: number, draftId: string): Promise<void> {
-  await telegramEdit(env, chatId, messageId, "Шаг 3 из 3. Выберите тип заметки:", noteTypeKeyboard(draftId));
+  const draft = await env.DB.prepare("SELECT selected_folder_id FROM telegram_drafts WHERE id = ?").bind(draftId).first<{ selected_folder_id?: string }>();
+  const folder = draft?.selected_folder_id
+    ? await env.DB.prepare("SELECT name FROM folders WHERE id = ?").bind(draft.selected_folder_id).first<{ name: string }>()
+    : null;
+  await telegramEdit(
+    env,
+    chatId,
+    messageId,
+    isBooksFolderName(folder?.name || "") ? "Шаг 3 из 3. Выберите тип заметки для главы:" : "Шаг 3 из 3. Выберите тип заметки:",
+    noteTypeKeyboard(draftId),
+  );
 }
 
 async function handlePendingStudyBlockName(env: Env, userId: string, chatId: number, rawName: string): Promise<boolean> {
@@ -842,13 +1074,20 @@ async function handlePendingStudyBlockName(env: Env, userId: string, chatId: num
   if (!draft?.selected_folder_id) return false;
 
   const name = cleanName(rawName, 60);
+  const folder = await env.DB.prepare("SELECT name FROM folders WHERE id = ?").bind(draft.selected_folder_id).first<{ name: string }>();
+  const isBooks = isBooksFolderName(folder?.name || "");
   const topicId = crypto.randomUUID();
   await env.DB.prepare("INSERT INTO topics (id, folder_id, name) VALUES (?, ?, ?)").bind(topicId, draft.selected_folder_id, name).run();
   await env.DB
     .prepare("UPDATE telegram_drafts SET selected_topic_id = ?, pending_step = 'type' WHERE id = ? AND telegram_user_id = ?")
     .bind(topicId, draft.id, userId)
     .run();
-  await telegramSend(env, chatId, `Учебный блок создан: ${studyBlockDisplayName(name)}. Теперь выберите тип заметки:`, noteTypeKeyboard(draft.id));
+  await telegramSend(
+    env,
+    chatId,
+    `${isBooks ? "Глава" : "Учебный блок"} создан${isBooks ? "а" : ""}: ${studyBlockDisplayName(name)}. Теперь выберите тип заметки:`,
+    noteTypeKeyboard(draft.id),
+  );
   return true;
 }
 
@@ -891,6 +1130,10 @@ function withTypeTag(content: string, tag: string): string {
 
 function studyBlockDisplayName(name: string): string {
   return name.trim().toLowerCase() === "general" ? "General study block" : name;
+}
+
+function isBooksFolderName(name: string): boolean {
+  return name.trim().toLowerCase() === "books";
 }
 
 async function sendFolderPicker(env: Env, chatId: number, draftId: string): Promise<void> {
