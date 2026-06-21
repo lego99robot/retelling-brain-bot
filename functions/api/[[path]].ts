@@ -761,8 +761,10 @@ function inferAiAction(text: string): string | null {
 function isMemoryQuestion(text: string): boolean {
   const normalized = normalizeSearchText(text);
   if (!normalized) return false;
-  if (/^(add|save|create|добав|сохран|созда|запиши)\b/.test(normalized)) return false;
-  return /\b(find|search|tell|what|who|where|when|why|how|information|info)\b/.test(normalized) || /\b(найти|найди|ищи|поиск|информац|что|кто|где|когда|почему|как|расскажи|покажи|дай)\b/.test(normalized);
+  const savePrefixes = ["добав", "сохран", "созда", "запиши"];
+  if (/^(add|save|create)\b/.test(normalized) || savePrefixes.some((prefix) => normalized.startsWith(prefix))) return false;
+  const questionWords = ["найти", "найди", "ищи", "поиск", "информац", "что", "кто", "где", "когда", "почему", "как", "расскажи", "покажи", "дай"];
+  return /\b(find|search|tell|what|who|where|when|why|how|information|info)\b/.test(normalized) || questionWords.some((word) => normalized.includes(word));
 }
 
 function telegramQuestionInstruction(text: string): string {
