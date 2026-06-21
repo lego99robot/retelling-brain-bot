@@ -184,6 +184,8 @@ async function ensureDefaults(db: D1Database): Promise<void> {
     statements.push(db.prepare("INSERT OR IGNORE INTO folders (id, name) VALUES (?, ?)").bind(folderId, name));
     statements.push(db.prepare("INSERT OR IGNORE INTO topics (id, folder_id, name) VALUES (?, ?, ?)").bind(topicId, folderId, "General"));
   }
+  statements.push(db.prepare("CREATE TABLE IF NOT EXISTS telegram_processed_updates (update_id INTEGER PRIMARY KEY, telegram_user_id TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"));
+  statements.push(db.prepare("CREATE INDEX IF NOT EXISTS idx_processed_updates_created ON telegram_processed_updates(created_at)"));
   await db.batch(statements);
 }
 
@@ -993,6 +995,11 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
     return json({ ok: true });
   }
 
+  if (typeof update.update_id === "number") {
+    const firstTime = await rememberTelegramUpdate(env.DB, update.update_id, String(userId));
+    if (!firstTime) return json({ ok: true, duplicate: true });
+  }
+
   if (update.callback_query) {
     await handleTelegramCallback(env, update.callback_query, String(userId));
     return json({ ok: true });
@@ -1058,6 +1065,14 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
   return json({ ok: true });
 }
 
+async function rememberTelegramUpdate(db: D1Database, updateId: number, userId: string): Promise<boolean> {
+  const result = await db
+    .prepare("INSERT OR IGNORE INTO telegram_processed_updates (update_id, telegram_user_id) VALUES (?, ?)")
+    .bind(updateId, userId)
+    .run();
+  await db.prepare("DELETE FROM telegram_processed_updates WHERE created_at < datetime('now', '-2 days')").run();
+  return (result.meta?.changes || 0) > 0;
+}
 async function setTelegramWebhook(request: Request, env: Env): Promise<Response> {
   if (!env.TELEGRAM_BOT_TOKEN) return json({ error: "TELEGRAM_BOT_TOKEN is not configured" }, 500);
   const origin = new URL(request.url).origin;
@@ -1549,6 +1564,7 @@ interface RagSourceRow {
   folder_name: string;
 }
 interface TelegramUpdate {
+  update_id?: number;
   message?: TelegramMessage;
   callback_query?: TelegramCallbackQuery;
 }
