@@ -693,6 +693,7 @@ function aiInstruction(action: string): string {
     plan: "Create an English retelling plan with 5-8 short points.",
     tasks: "Create review tasks in English for practicing this material: questions, gap-fill prompts, and 3 retelling prompts.",
     extract: "Extract useful English words, names, and facts from the saved material. Group them clearly.",
+    answer: "Answer the user question using only the saved material. If the saved material does not contain the answer, say that the information is not in the saved memory and suggest what to add.",
   };
   return map[action] || map.short;
 }
@@ -729,7 +730,7 @@ async function handleTelegramAiTextRequest(env: Env, chatId: number, text: strin
 
   await telegramSend(env, chatId, "Готовлю ответ по сохраненной информации...");
   try {
-    const response = await callOpenRouter(env, action, context, inferLanguageInstruction(text));
+    const response = await callOpenRouter(env, action, context, telegramQuestionInstruction(text));
     await env.DB
       .prepare(
         `INSERT INTO ai_usage (usage_date, user_key, count) VALUES (?, ?, 1)
@@ -746,6 +747,7 @@ async function handleTelegramAiTextRequest(env: Env, chatId: number, text: strin
 }
 
 function inferAiAction(text: string): string | null {
+  if (isMemoryQuestion(text)) return "answer";
   const normalized = text.toLowerCase();
   if (/\ba2\b|а2|уровн[яю]\s*a2/.test(normalized)) return "a2";
   if (/\bb1\b|в1|b 1|уровн[яю]\s*b1/.test(normalized)) return "b1";
@@ -756,6 +758,17 @@ function inferAiAction(text: string): string | null {
   return null;
 }
 
+function isMemoryQuestion(text: string): boolean {
+  const normalized = normalizeSearchText(text);
+  if (!normalized) return false;
+  if (/^(add|save|create|добав|сохран|созда|запиши)\b/.test(normalized)) return false;
+  return /\b(find|search|tell|what|who|where|when|why|how|information|info)\b/.test(normalized) || /\b(найти|найди|ищи|поиск|информац|что|кто|где|когда|почему|как|расскажи|покажи|дай)\b/.test(normalized);
+}
+
+function telegramQuestionInstruction(text: string): string {
+  const language = inferLanguageInstruction(text);
+  return `${language ? `${language}\n` : ""}User question: ${text.trim()}\nAnswer this question directly. Use only the saved material above. Do not treat the question as a note to save.`;
+}
 type TelegramAiScope = { context: AiContext } | { message: string };
 
 async function inferTelegramAiScope(db: D1Database, text: string): Promise<TelegramAiScope> {
@@ -767,6 +780,9 @@ async function inferTelegramAiScope(db: D1Database, text: string): Promise<Teleg
 
   const folderId = await inferFolderId(db, text);
   if (!folderId) {
+    if (booksFolder && isMemoryQuestion(text)) {
+      return { context: await buildFolderContext(db, booksFolder.id) };
+    }
     return {
       message:
         "Я понял AI-запрос, но не понял папку, книгу или главу. Напишите, например: \"Сделай короткое описание по папке Books на английском\" или \"Сделай B1 пересказ по первой главе\".",
