@@ -342,6 +342,19 @@ function Workspace({ role, onLogout }: { role: Role; onLogout: () => void }) {
               <Bot />
             </button>
           )}
+          {role === "owner" && (
+            <button
+              className="ghost"
+              onClick={() =>
+                api<{ chunks: number; namespace: string }>("/api/rag/reindex", { method: "POST", body: "{}" })
+                  .then((data) => setNotice(`RAG indexed ${data.chunks} chunks in ${data.namespace}`))
+                  .catch(showError(setNotice))
+              }
+              title="Reindex RAG memory"
+            >
+              <Sparkles />
+            </button>
+          )}
         </header>
 
         {notice && <p className="notice">{notice}</p>}

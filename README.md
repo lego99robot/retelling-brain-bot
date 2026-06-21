@@ -50,6 +50,17 @@ Telegram-first MVP for saving English retelling notes and compressed photos, the
   - `WEB_PASSWORD_TEATH`
   - `OPENROUTER_API_KEY`
   - `OPENROUTER_MODEL`
+  - `UPSTASH_VECTOR_REST_URL`
+  - `UPSTASH_VECTOR_REST_TOKEN`
+  - `UPSTASH_VECTOR_NAMESPACE`
+  - `UPSTASH_VECTOR_INDEX_ID` (optional note-only id)
+
+## RAG With Upstash Vector
+
+- D1 remains the source of truth. Upstash Vector stores only searchable chunks from `Books` notes and manual photo descriptions.
+- Reindex manually from the owner toolbar using the sparkle button, or call `POST /api/rag/reindex` while logged in as owner.
+- The index must support Upstash managed embeddings because the app upserts and queries raw `data` text.
+- If Upstash secrets are missing or Vector is unavailable, AI falls back to the existing D1 context.
 
 ## Pre-RAG Memory Rules
 

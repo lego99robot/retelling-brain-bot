@@ -1,3 +1,5 @@
+import { Index } from "@upstash/vector";
+
 export interface Env {
   DB: D1Database;
   PHOTOS?: R2Bucket;
@@ -8,12 +10,16 @@ export interface Env {
   WEB_PASSWORD_TEATH?: string;
   OPENROUTER_API_KEY?: string;
   OPENROUTER_MODEL?: string;
+  UPSTASH_VECTOR_REST_URL?: string;
+  UPSTASH_VECTOR_REST_TOKEN?: string;
+  UPSTASH_VECTOR_NAMESPACE?: string;
+  UPSTASH_VECTOR_INDEX_ID?: string;
 }
 
 type Role = "owner" | "teacher";
 type Session = { role: Role };
 type ApiContext = EventContext<Env, string, unknown>;
-type AiContext = { topicName: string; text: string; fingerprint: string };
+type AiContext = { topicName: string; text: string; fingerprint: string; ragFilter?: string; ragQuery?: string };
 
 const DEFAULT_FOLDERS = ["Books", "Films", "Videos", "Vocabulary", "Inbox"] as const;
 const AI_DAILY_LIMIT = 10;
@@ -107,6 +113,10 @@ async function route(context: ApiContext): Promise<Response> {
 
   if (parts[0] === "ai" && parts[1] === "topic-action" && method === "POST") {
     return runTopicAiAction(request, env, session);
+  }
+
+  if (parts[0] === "rag" && parts[1] === "reindex" && method === "POST") {
+    return reindexRag(request, env, session);
   }
 
   return json({ error: "Not found" }, 404);
@@ -392,7 +402,7 @@ async function runTopicAiAction(request: Request, env: Env, session: Session): P
   const action = normalizeAiAction(body.action);
   if (!action) return json({ error: "Unknown AI action" }, 400);
 
-  const context = await buildTopicContext(env.DB, body.topicId);
+  const context = await buildRagEnhancedTopicContext(env, body.topicId, action);
   if (!context.topicName) return json({ error: "Study block not found" }, 404);
   if (context.text.trim().length < 40) {
     return json({
@@ -442,7 +452,7 @@ async function buildTopicContext(db: D1Database, topicId: string): Promise<AiCon
     ...(photos.results || []).map((photo) => `Photo description: ${photo.description}`),
   ];
   const fingerprint = JSON.stringify({ topic, notes: notes.results, photos: photos.results });
-  return { topicName: topic.name, text: textParts.join("\n"), fingerprint };
+  return { topicName: topic.name, text: textParts.join("\n"), fingerprint, ragFilter: `topicId = '${escapeRagFilterValue(topicId)}'`, ragQuery: topic.name };
 }
 
 async function buildFolderContext(db: D1Database, folderId: string): Promise<AiContext> {
@@ -472,7 +482,7 @@ async function buildFolderContext(db: D1Database, folderId: string): Promise<AiC
     ...(photos.results || []).map((photo) => `Study block "${photo.topic_name}" photo description: ${photo.description}`),
   ];
   const fingerprint = JSON.stringify({ folder, notes: notes.results, photos: photos.results });
-  return { topicName: folder.name, text: textParts.join("\n").slice(0, 12000), fingerprint };
+  return { topicName: folder.name, text: textParts.join("\n").slice(0, 12000), fingerprint, ragFilter: `folderId = '${escapeRagFilterValue(folder.id)}'`, ragQuery: folder.name };
 }
 
 async function buildTopicsContext(db: D1Database, topics: Array<{ id: string; name: string }>, label: string): Promise<AiContext> {
@@ -483,7 +493,147 @@ async function buildTopicsContext(db: D1Database, topics: Array<{ id: string; na
     if (context.text.trim()) textParts.push(context.text);
   }
   const fingerprint = JSON.stringify({ label, topics, contexts: contexts.map((context) => context.fingerprint) });
-  return { topicName: label, text: textParts.join("\n\n").slice(0, 12000), fingerprint };
+  const topicIds = topics.map((topic) => `'${escapeRagFilterValue(topic.id)}'`).join(", ");
+  return { topicName: label, text: textParts.join("\n\n").slice(0, 12000), fingerprint, ragFilter: `topicId IN (${topicIds})`, ragQuery: label };
+}
+
+async function buildRagEnhancedTopicContext(env: Env, topicId: string, action: string): Promise<AiContext> {
+  const context = await buildTopicContext(env.DB, topicId);
+  if (!context.topicName) return context;
+  return enhanceContextWithRag(env, context, `${aiInstruction(action)} ${context.topicName}`);
+}
+
+async function enhanceContextWithRag(env: Env, context: AiContext, query: string): Promise<AiContext> {
+  const index = getRagIndex(env);
+  if (!index || !context.ragFilter) return context;
+
+  try {
+    const namespace = index.namespace(getRagNamespace(env));
+    const results = (await namespace.query({
+      data: `${query}\n${context.ragQuery || context.topicName}`,
+      topK: 10,
+      includeData: true,
+      includeMetadata: true,
+      filter: context.ragFilter,
+    })) as Array<{ id: string; score?: number; data?: unknown; metadata?: Record<string, unknown> }>;
+
+    const chunks = results
+      .filter((result) => String(result.data || "").trim())
+      .map((result, index) => {
+        const metadata = result.metadata || {};
+        const location = [metadata.folder, metadata.book, metadata.studyBlock, metadata.noteType].filter(Boolean).join(" / ");
+        return `RAG chunk ${index + 1}${location ? ` (${location})` : ""}: ${String(result.data).trim()}`;
+      });
+
+    if (!chunks.length) return context;
+    const text = [`Relevant RAG memory for: ${context.topicName}`, ...chunks, "Fallback saved material:", context.text].join("\n\n").slice(0, 12000);
+    const fingerprint = JSON.stringify({ base: context.fingerprint, rag: results.map((result) => ({ id: result.id, score: result.score, metadata: result.metadata })) });
+    return { ...context, text, fingerprint };
+  } catch (error) {
+    console.error("Upstash RAG query failed", error);
+    return context;
+  }
+}
+
+async function reindexRag(request: Request, env: Env, session: Session): Promise<Response> {
+  requireOwner(session);
+  const index = getRagIndex(env);
+  if (!index) return json({ error: "UPSTASH_VECTOR_REST_URL and UPSTASH_VECTOR_REST_TOKEN are not configured" }, 500);
+
+  const namespaceName = getRagNamespace(env);
+  const namespace = index.namespace(namespaceName);
+  const rows = await collectRagRows(env.DB);
+  const vectors = rows.map((row) => {
+    const tags = parseTagsJson(row.tags_json);
+    const noteType = inferNoteTypeFromTags(tags);
+    const book = bookTitleFromStudyBlock(row.topic_name) || row.topic_name;
+    const chapter = extractChapterNumber(row.topic_name);
+    const data = [
+      `Folder: ${row.folder_name}`,
+      `Book: ${book}`,
+      `Study block: ${row.topic_name}`,
+      chapter ? `Chapter: ${chapter}` : "",
+      `Type: ${noteType}`,
+      row.content,
+    ]
+      .filter(Boolean)
+      .join("\n");
+    return {
+      id: `${row.source_type}:${row.source_id}`,
+      data,
+      metadata: {
+        folder: row.folder_name,
+        folderId: row.folder_id,
+        book,
+        studyBlock: row.topic_name,
+        topicId: row.topic_id,
+        chapter,
+        noteType,
+        tags,
+        sourceType: row.source_type,
+        sourceId: row.source_id,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      },
+    };
+  });
+
+  await index.reset({ namespace: namespaceName });
+  for (let indexOffset = 0; indexOffset < vectors.length; indexOffset += 50) {
+    await namespace.upsert(vectors.slice(indexOffset, indexOffset + 50));
+  }
+
+  return json({ ok: true, namespace: namespaceName, chunks: vectors.length });
+}
+
+async function collectRagRows(db: D1Database): Promise<RagSourceRow[]> {
+  const result = await db
+    .prepare(
+      `SELECT 'note' AS source_type, n.id AS source_id, n.content AS content, n.tags_json,
+        n.created_at, n.updated_at, t.id AS topic_id, t.name AS topic_name, f.id AS folder_id, f.name AS folder_name
+       FROM notes n
+       JOIN topics t ON t.id = n.topic_id
+       JOIN folders f ON f.id = t.folder_id
+       WHERE f.name = 'Books'
+       UNION ALL
+       SELECT 'photo' AS source_type, p.id AS source_id, p.description AS content, p.tags_json,
+        p.created_at, p.updated_at, t.id AS topic_id, t.name AS topic_name, f.id AS folder_id, f.name AS folder_name
+       FROM photos p
+       JOIN topics t ON t.id = p.topic_id
+       JOIN folders f ON f.id = t.folder_id
+       WHERE f.name = 'Books' AND p.description <> ''
+       ORDER BY topic_name ASC, created_at ASC`,
+    )
+    .all<RagSourceRow>();
+  return (result.results || []).filter((row) => row.content.trim());
+}
+
+function getRagIndex(env: Env): Index | null {
+  if (!env.UPSTASH_VECTOR_REST_URL || !env.UPSTASH_VECTOR_REST_TOKEN) return null;
+  return new Index({ url: env.UPSTASH_VECTOR_REST_URL, token: env.UPSTASH_VECTOR_REST_TOKEN });
+}
+
+function getRagNamespace(env: Env): string {
+  return env.UPSTASH_VECTOR_NAMESPACE || "retelling-brain-bot";
+}
+
+function parseTagsJson(value: string): string[] {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+function inferNoteTypeFromTags(tags: string[]): string {
+  const normalized = tags.map((tag) => tag.toLowerCase());
+  const known = ["#plot", "#words", "#facts", "#names", "#opinion", "#retelling", "#photo"];
+  return known.find((tag) => normalized.includes(tag))?.replace("#", "") || "note";
+}
+
+function escapeRagFilterValue(value: string): string {
+  return value.replace(/'/g, "''");
 }
 
 async function callOpenRouter(env: Env, action: string, topicContext: AiContext, languageInstruction = ""): Promise<string> {
@@ -557,7 +707,7 @@ async function handleTelegramAiTextRequest(env: Env, chatId: number, text: strin
     return true;
   }
 
-  const context = scope.context;
+  const context = await enhanceContextWithRag(env, scope.context, text);
   if (!context.topicName) {
     await telegramSend(env, chatId, "Не нашла подходящую папку или главу. Напишите, например: \"Сделай короткое описание по папке Books на английском\" или \"Сделай B1 пересказ по первой главе\".");
     return true;
@@ -1368,6 +1518,18 @@ function json(data: unknown, status = 200, headers: HeadersInit = {}): Response 
   });
 }
 
+interface RagSourceRow {
+  source_type: "note" | "photo";
+  source_id: string;
+  content: string;
+  tags_json: string;
+  created_at: string;
+  updated_at: string;
+  topic_id: string;
+  topic_name: string;
+  folder_id: string;
+  folder_name: string;
+}
 interface TelegramUpdate {
   message?: TelegramMessage;
   callback_query?: TelegramCallbackQuery;
