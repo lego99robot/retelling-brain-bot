@@ -184,8 +184,13 @@ async function ensureDefaults(db: D1Database): Promise<void> {
     statements.push(db.prepare("INSERT OR IGNORE INTO folders (id, name) VALUES (?, ?)").bind(folderId, name));
     statements.push(db.prepare("INSERT OR IGNORE INTO topics (id, folder_id, name) VALUES (?, ?, ?)").bind(topicId, folderId, "General"));
   }
-  statements.push(db.prepare("CREATE TABLE IF NOT EXISTS telegram_processed_updates (update_id INTEGER PRIMARY KEY, telegram_user_id TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"));
+  statements.push(
+    db.prepare(
+      "CREATE TABLE IF NOT EXISTS telegram_processed_updates (update_id INTEGER PRIMARY KEY, telegram_user_id TEXT, status TEXT NOT NULL DEFAULT 'processing', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+    ),
+  );
   statements.push(db.prepare("CREATE INDEX IF NOT EXISTS idx_processed_updates_created ON telegram_processed_updates(created_at)"));
+  statements.push(db.prepare("CREATE INDEX IF NOT EXISTS idx_processed_updates_status_updated ON telegram_processed_updates(status, updated_at)"));
   await db.batch(statements);
 }
 
@@ -656,7 +661,7 @@ async function callOpenRouter(env: Env, action: string, topicContext: AiContext,
         {
           role: "system",
           content:
-            "You are an English retelling tutor. Use only the provided saved notes and manual photo descriptions. If there is not enough information, say so honestly in Russian first. Never invent facts.",
+            "You are an English retelling tutor. Use only the provided saved notes and manual photo descriptions. If there is not enough information, say so honestly in the requested answer language; if no language is requested, say it in Russian. Never invent facts.",
         },
         {
           role: "user",
@@ -996,39 +1001,47 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
   }
 
   if (typeof update.update_id === "number") {
-    const firstTime = await rememberTelegramUpdate(env.DB, update.update_id, String(userId));
+    const firstTime = await beginTelegramUpdate(env.DB, update.update_id, String(userId));
     if (!firstTime) return json({ ok: true, duplicate: true });
   }
 
+  const complete = async (body: Record<string, unknown> = { ok: true }): Promise<Response> => {
+    if (typeof update.update_id === "number") {
+      await finishTelegramUpdate(env.DB, update.update_id, "done");
+    }
+    return json(body);
+  };
+
+  try {
   if (update.callback_query) {
     await handleTelegramCallback(env, update.callback_query, String(userId));
-    return json({ ok: true });
+    return complete();
   }
 
   const message = update.message;
-  if (!message) return json({ ok: true });
+  if (!message) return complete();
 
   if (message.text?.startsWith("/start")) {
     await telegramSend(env, userId, "Retelling Brain Bot готов. Отправьте заметку или фото, затем выберите папку, учебный блок и тип заметки.");
-    return json({ ok: true });
+    return complete();
   }
 
   if (String(userId) === String(env.TEACHER_TELEGRAM_ID) && String(userId) !== String(env.OWNER_TELEGRAM_ID)) {
     await telegramSend(env, userId, "Доступ преподавателя активен. Комментарии удобнее добавлять в веб-панели.");
-    return json({ ok: true });
+    return complete();
   }
 
   if (message.text && /^фото$/iu.test(message.text.trim())) {
     await telegramSend(env, userId, "Отправьте само изображение через кнопку 📎 / Фото. Тогда я сохраню его как фото и спрошу папку, учебный блок и тип.");
-    return json({ ok: true });
+    return complete();
   }
 
   if (message.text) {
     const handledPendingName = await handlePendingStudyBlockName(env, String(userId), message.chat.id, message.text);
-    if (handledPendingName) return json({ ok: true });
+    if (handledPendingName) return complete();
 
     const handledAiRequest = await handleTelegramAiTextRequest(env, message.chat.id, message.text);
-    if (handledAiRequest) return json({ ok: true });
+    if (handledAiRequest) return complete();
 
     const content = cleanContent(message.text, NOTE_LIMIT);
     const draftId = telegramDraftId();
@@ -1037,7 +1050,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
       .bind(draftId, String(userId), content)
       .run();
     await sendFolderPicker(env, userId, draftId);
-    return json({ ok: true });
+    return complete();
   }
 
   if (message.photo?.length) {
@@ -1048,7 +1061,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
       .bind(draftId, String(userId), String(message.caption || "").trim().slice(0, NOTE_LIMIT), chosen.file_id, chosen.width, chosen.height)
       .run();
     await sendFolderPicker(env, userId, draftId);
-    return json({ ok: true });
+    return complete();
   }
 
   if (message.document?.mime_type?.startsWith("image/")) {
@@ -1058,21 +1071,53 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
       .bind(draftId, String(userId), String(message.caption || "").trim().slice(0, NOTE_LIMIT), message.document.file_id, null, null)
       .run();
     await sendFolderPicker(env, userId, draftId);
-    return json({ ok: true });
+    return complete();
   }
 
   await telegramSend(env, userId, "Пока я сохраняю только текстовые заметки и фото.");
-  return json({ ok: true });
+  return complete();
+  } catch (error) {
+    if (typeof update.update_id === "number") {
+      await finishTelegramUpdate(env.DB, update.update_id, "failed");
+    }
+    throw error;
+  }
 }
 
-async function rememberTelegramUpdate(db: D1Database, updateId: number, userId: string): Promise<boolean> {
-  const result = await db
-    .prepare("INSERT OR IGNORE INTO telegram_processed_updates (update_id, telegram_user_id) VALUES (?, ?)")
+async function beginTelegramUpdate(db: D1Database, updateId: number, userId: string): Promise<boolean> {
+  const existing = await db
+    .prepare("SELECT status, created_at, updated_at FROM telegram_processed_updates WHERE update_id = ?")
+    .bind(updateId)
+    .first<{ status?: string; created_at?: string; updated_at?: string }>();
+
+  if (existing) {
+    const timestamp = Date.parse(existing.updated_at || existing.created_at || "");
+    const isStale = Number.isFinite(timestamp) && Date.now() - timestamp > 90_000;
+    if (existing.status === "failed" || isStale) {
+      await db
+        .prepare("UPDATE telegram_processed_updates SET telegram_user_id = ?, status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE update_id = ?")
+        .bind(userId, updateId)
+        .run();
+      return true;
+    }
+    return false;
+  }
+
+  await db
+    .prepare("INSERT INTO telegram_processed_updates (update_id, telegram_user_id, status) VALUES (?, ?, 'processing')")
     .bind(updateId, userId)
     .run();
   await db.prepare("DELETE FROM telegram_processed_updates WHERE created_at < datetime('now', '-2 days')").run();
-  return (result.meta?.changes || 0) > 0;
+  return true;
 }
+
+async function finishTelegramUpdate(db: D1Database, updateId: number, status: "done" | "failed"): Promise<void> {
+  await db
+    .prepare("UPDATE telegram_processed_updates SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE update_id = ?")
+    .bind(status, updateId)
+    .run();
+}
+
 async function setTelegramWebhook(request: Request, env: Env): Promise<Response> {
   if (!env.TELEGRAM_BOT_TOKEN) return json({ error: "TELEGRAM_BOT_TOKEN is not configured" }, 500);
   const origin = new URL(request.url).origin;
