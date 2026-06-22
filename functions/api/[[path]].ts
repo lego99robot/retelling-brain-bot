@@ -26,6 +26,7 @@ const AI_DAILY_LIMIT = 10;
 const NOTE_LIMIT = 1000;
 const MAX_WEB_PHOTO_BYTES = 3 * 1024 * 1024;
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_TIMEOUT_MS = 60_000;
 const NOTE_TYPES = [
   { id: "photo", label: "Photo", tag: "#photo" },
   { id: "plot", label: "Plot", tag: "#plot" },
@@ -61,7 +62,7 @@ async function route(context: ApiContext): Promise<Response> {
 
   if (parts[0] === "telegram" && parts[1] === "webhook" && method === "POST") {
     await ensureDefaults(env.DB);
-    return handleTelegramWebhook(request, env);
+    return handleTelegramWebhook(request, env, context);
   }
 
   if (parts[0] === "auth" && parts[1] === "login" && method === "POST") {
@@ -647,31 +648,44 @@ async function callOpenRouter(env: Env, action: string, topicContext: AiContext,
   if (!env.OPENROUTER_API_KEY) throw httpError(500, "OPENROUTER_API_KEY is not configured");
   const model = env.OPENROUTER_MODEL || "nvidia/nemotron-3-ultra-550b-a55b:free";
   const prompt = `${aiInstruction(action)}${languageInstruction ? `\n${languageInstruction}` : ""}`;
-  const response = await fetch(OPENROUTER_URL, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": "https://retelling-brain-bot.local",
-      "X-Title": "Retelling Brain Bot",
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are an English retelling tutor. Use only the provided saved notes and manual photo descriptions. If there is not enough information, say so honestly in the requested answer language; if no language is requested, say it in Russian. Never invent facts.",
-        },
-        {
-          role: "user",
-          content: `${prompt}\n\nSaved material:\n${topicContext.text}`,
-        },
-      ],
-      temperature: 0.35,
-      max_tokens: 900,
-    }),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), OPENROUTER_TIMEOUT_MS);
+  let response: Response;
+  try {
+    response = await fetch(OPENROUTER_URL, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://retelling-brain-bot.local",
+        "X-Title": "Retelling Brain Bot",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are an English retelling tutor. Use only the provided saved notes and manual photo descriptions. If there is not enough information, say so honestly in the requested answer language; if no language is requested, say it in Russian. Never invent facts.",
+          },
+          {
+            role: "user",
+            content: `${prompt}\n\nSaved material:\n${topicContext.text}`,
+          },
+        ],
+        temperature: 0.35,
+        max_tokens: 900,
+      }),
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw httpError(504, "OpenRouter request timed out. Please try again later.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   if (!response.ok) {
     const details = await response.text();
@@ -686,7 +700,6 @@ async function callOpenRouter(env: Env, action: string, topicContext: AiContext,
   if (!content) throw httpError(502, "OpenRouter returned an empty response");
   return content;
 }
-
 function normalizeAiAction(action?: string): string | null {
   const allowed = new Set(["short", "a2", "b1", "plan", "tasks", "extract"]);
   return action && allowed.has(action) ? action : null;
@@ -753,6 +766,28 @@ async function handleTelegramAiTextRequest(env: Env, chatId: number, text: strin
   return true;
 }
 
+function queueTelegramAiTextRequest(context: ApiContext, env: Env, chatId: number, text: string, updateId?: number): void {
+  context.waitUntil(
+    (async () => {
+      try {
+        await handleTelegramAiTextRequest(env, chatId, text);
+        if (typeof updateId === "number") {
+          await finishTelegramUpdate(env.DB, updateId, "done");
+        }
+      } catch (error) {
+        console.error("Telegram AI background request failed", error);
+        if (typeof updateId === "number") {
+          await finishTelegramUpdate(env.DB, updateId, "failed");
+        }
+        try {
+          await telegramSend(env, chatId, "AI-запрос не успел обработаться. Попробуйте ещё раз или задайте вопрос короче.");
+        } catch (sendError) {
+          console.error("Telegram AI failure notification failed", sendError);
+        }
+      }
+    })(),
+  );
+}
 function inferAiAction(text: string): string | null {
   if (isMemoryQuestion(text)) return "answer";
   const normalized = text.toLowerCase();
@@ -992,7 +1027,7 @@ function inferLanguageInstruction(text: string): string {
   return "";
 }
 
-async function handleTelegramWebhook(request: Request, env: Env): Promise<Response> {
+async function handleTelegramWebhook(request: Request, env: Env, context: ApiContext): Promise<Response> {
   const update = (await request.json()) as TelegramUpdate;
   const userId = getTelegramUserId(update);
   if (!userId || !isAllowedTelegramUser(env, userId)) {
@@ -1040,8 +1075,10 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
     const handledPendingName = await handlePendingStudyBlockName(env, String(userId), message.chat.id, message.text);
     if (handledPendingName) return complete();
 
-    const handledAiRequest = await handleTelegramAiTextRequest(env, message.chat.id, message.text);
-    if (handledAiRequest) return complete();
+    if (inferAiAction(message.text)) {
+      queueTelegramAiTextRequest(context, env, message.chat.id, message.text, update.update_id);
+      return json({ ok: true, queued: true });
+    }
 
     const content = cleanContent(message.text, NOTE_LIMIT);
     const draftId = telegramDraftId();
