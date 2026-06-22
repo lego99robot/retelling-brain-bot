@@ -766,6 +766,86 @@ async function handleTelegramAiTextRequest(env: Env, chatId: number, text: strin
   return true;
 }
 
+async function handleTelegramMemorySearch(env: Env, chatId: number, text: string): Promise<boolean> {
+  if (!isMemoryQuestion(text)) return false;
+
+  const scope = await inferTelegramAiScope(env.DB, text);
+  if ("message" in scope) {
+    await telegramSend(env, chatId, scope.message);
+    return true;
+  }
+
+  const context = scope.context;
+  if (!context.topicName || context.text.trim().length < 40) {
+    await telegramSend(env, chatId, memoryNoDataMessage(text, "выбранной папке или главе"));
+    return true;
+  }
+
+  const entries = extractMemoryEntries(context.text);
+  const keywords = extractSearchKeywords(text);
+  const matches = keywords.length
+    ? entries.filter((entry) => {
+        const normalized = normalizeSearchText(entry);
+        return keywords.some((keyword) => normalized.includes(keyword));
+      })
+    : entries;
+
+  if (!matches.length) {
+    await telegramSend(env, chatId, memoryNoDataMessage(text, context.topicName));
+    return true;
+  }
+
+  const answerInEnglish = /english|английск|на английском|in english/i.test(text);
+  const header = answerInEnglish
+    ? `I found this in saved memory (${context.topicName}):`
+    : `Нашла в сохраненной памяти (${context.topicName}):`;
+  const body = matches.slice(0, 6).map((entry) => `- ${entry}`).join("\n\n");
+  const footer = matches.length > 6 ? (answerInEnglish ? "\n\nThere is more saved material, but I showed the closest notes." : "\n\nЕсть еще материалы, я показала самые близкие заметки.") : "";
+  await telegramSendLong(env, chatId, `${header}\n\n${body}${footer}`);
+  return true;
+}
+
+function extractMemoryEntries(contextText: string): string[] {
+  return contextText
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("Note:") || line.startsWith("Photo description:"))
+    .map((line) => line.replace(/^(Note:|Photo description:)\s*/i, "").trim())
+    .filter(Boolean);
+}
+
+function extractSearchKeywords(text: string): string[] {
+  const normalized = normalizeSearchText(text);
+  const stopWords = new Set([
+    "найти", "найди", "ищи", "поиск", "информацию", "информация", "информац", "из", "по", "о", "об", "про", "мне", "дай", "покажи", "расскажи",
+    "глава", "главы", "главе", "главу", "папка", "папке", "книга", "книги", "на", "английском", "русском", "сделай",
+    "find", "search", "information", "info", "about", "from", "chapter", "chapters", "book", "books", "in", "english", "russian", "tell", "show", "give",
+  ]);
+  const words = normalized
+    .split(" ")
+    .filter((word) => word.length > 1 && !/^\d+$/.test(word) && !stopWords.has(word));
+  const expanded = new Set<string>();
+  for (const word of words) {
+    expanded.add(word);
+    if (["еда", "еде", "еду", "едой", "пища", "пищу"].includes(word)) {
+      ["food", "eat", "eating", "ate", "meal", "breakfast", "lunch", "dinner", "cake", "hamburger", "hamburgers", "sausage", "sausages"].forEach((item) => expanded.add(item));
+    }
+    if (["змея", "змею", "змее", "змеи"].includes(word)) {
+      ["snake", "reptile", "reptile house"].forEach((item) => expanded.add(normalizeSearchText(item)));
+    }
+    if (["зоопарк", "зоопарке", "зоопарка"].includes(word)) {
+      ["zoo", "reptile house"].forEach((item) => expanded.add(normalizeSearchText(item)));
+    }
+  }
+  return [...expanded].filter(Boolean);
+}
+
+function memoryNoDataMessage(text: string, scopeName: string): string {
+  const answerInEnglish = /english|английск|на английском|in english/i.test(text);
+  return answerInEnglish
+    ? `There is no saved information about this in ${scopeName}. I can answer only from your saved notes and manual photo descriptions.`
+    : `В ${scopeName} нет сохраненной информации по этому вопросу. Я могу отвечать только по твоим заметкам и ручным описаниям фото.`;
+}
 function queueTelegramAiTextRequest(context: ApiContext, env: Env, chatId: number, text: string, updateId?: number): void {
   context.waitUntil(
     (async () => {
@@ -1075,6 +1155,9 @@ async function handleTelegramWebhook(request: Request, env: Env, context: ApiCon
     const handledPendingName = await handlePendingStudyBlockName(env, String(userId), message.chat.id, message.text);
     if (handledPendingName) return complete();
 
+    const handledMemorySearch = await handleTelegramMemorySearch(env, message.chat.id, message.text);
+    if (handledMemorySearch) return complete();
+
     if (inferAiAction(message.text)) {
       queueTelegramAiTextRequest(context, env, message.chat.id, message.text, update.update_id);
       return json({ ok: true, queued: true });
@@ -1141,7 +1224,7 @@ async function beginTelegramUpdate(db: D1Database, updateId: number, userId: str
   }
 
   await db
-    .prepare("INSERT INTO telegram_processed_updates (update_id, telegram_user_id, status) VALUES (?, ?, 'processing')")
+    .prepare("INSERT INTO telegram_processed_updates (update_id, telegram_user_id, status, updated_at) VALUES (?, ?, 'processing', CURRENT_TIMESTAMP)")
     .bind(updateId, userId)
     .run();
   await db.prepare("DELETE FROM telegram_processed_updates WHERE created_at < datetime('now', '-2 days')").run();
