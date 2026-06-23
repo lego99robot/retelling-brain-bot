@@ -548,52 +548,59 @@ async function reindexRag(request: Request, env: Env, session: Session): Promise
   const index = getRagIndex(env);
   if (!index) return json({ error: "UPSTASH_VECTOR_REST_URL and UPSTASH_VECTOR_REST_TOKEN are not configured" }, 500);
 
-  const namespaceName = getRagNamespace(env);
-  const namespace = index.namespace(namespaceName);
-  const rows = await collectRagRows(env.DB);
-  const vectors = rows.map((row) => {
-    const tags = parseTagsJson(row.tags_json);
-    const noteType = inferNoteTypeFromTags(tags);
-    const book = bookTitleFromStudyBlock(row.topic_name) || row.topic_name;
-    const chapter = extractChapterNumber(row.topic_name);
-    const data = [
-      `Folder: ${row.folder_name}`,
-      `Book: ${book}`,
-      `Study block: ${row.topic_name}`,
-      chapter ? `Chapter: ${chapter}` : "",
-      `Type: ${noteType}`,
-      row.content,
-    ]
-      .filter(Boolean)
-      .join("\n");
-    return {
-      id: `${row.source_type}:${row.source_id}`,
-      data,
-      metadata: {
-        folder: row.folder_name,
-        folderId: row.folder_id,
-        book,
-        studyBlock: row.topic_name,
-        topicId: row.topic_id,
-        chapter,
-        noteType,
-        tags,
-        sourceType: row.source_type,
-        sourceId: row.source_id,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at,
-      },
-    };
-  });
+  let step = "collect";
+  try {
+    const namespaceName = getRagNamespace(env);
+    const namespace = index.namespace(namespaceName);
+    const rows = await collectRagRows(env.DB);
+    const vectors = rows.map((row) => {
+      const tags = parseTagsJson(row.tags_json);
+      const noteType = inferNoteTypeFromTags(tags);
+      const book = bookTitleFromStudyBlock(row.topic_name) || row.topic_name;
+      const chapter = extractChapterNumber(row.topic_name);
+      const data = [
+        `Folder: ${row.folder_name}`,
+        `Book: ${book}`,
+        `Study block: ${row.topic_name}`,
+        chapter ? `Chapter: ${chapter}` : "",
+        `Type: ${noteType}`,
+        row.content,
+      ]
+        .filter(Boolean)
+        .join("\n");
+      return {
+        id: `${row.source_type}:${row.source_id}`,
+        data,
+        metadata: {
+          folder: row.folder_name,
+          folderId: row.folder_id,
+          book,
+          studyBlock: row.topic_name,
+          topicId: row.topic_id,
+          chapter,
+          noteType,
+          tags,
+          sourceType: row.source_type,
+          sourceId: row.source_id,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at,
+        },
+      };
+    });
 
-  await index.reset({ namespace: namespaceName });
-  for (let indexOffset = 0; indexOffset < vectors.length; indexOffset += 50) {
-    await namespace.upsert(vectors.slice(indexOffset, indexOffset + 50));
+    step = "reset";
+    await index.reset({ namespace: namespaceName });
+    step = "upsert";
+    for (let indexOffset = 0; indexOffset < vectors.length; indexOffset += 50) {
+      await namespace.upsert(vectors.slice(indexOffset, indexOffset + 50));
+    }
+
+    return json({ ok: true, namespace: namespaceName, chunks: vectors.length });
+  } catch (error) {
+    console.error("Upstash RAG reindex failed", { step, error });
+    return json({ error: "Upstash RAG reindex failed", step, message: error instanceof Error ? error.message : String(error) }, 500);
   }
-
-  return json({ ok: true, namespace: namespaceName, chunks: vectors.length });
 }
-
 async function collectRagRows(db: D1Database): Promise<RagSourceRow[]> {
   const result = await db
     .prepare(
