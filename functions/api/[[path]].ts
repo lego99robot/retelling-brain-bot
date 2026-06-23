@@ -21,6 +21,14 @@ type AiContext = { topicName: string; text: string; fingerprint: string; ragFilt
 type UpstashVectorResult = { id: string; score?: number; data?: unknown; metadata?: Record<string, unknown> };
 type RagReindexOptions = { offset?: unknown; limit?: unknown; reset?: unknown };
 type RagVector = { id: string; data: string; metadata: Record<string, unknown> };
+type OpenLibraryBook = {
+  title: string;
+  authors: string[];
+  firstPublishYear?: number;
+  coverUrl?: string;
+  workKey?: string;
+  openLibraryUrl?: string;
+};
 
 const DEFAULT_FOLDERS = ["Books", "Films", "Videos", "Vocabulary", "Inbox"] as const;
 const AI_DAILY_LIMIT = 10;
@@ -28,6 +36,7 @@ const NOTE_LIMIT = 1000;
 const MAX_WEB_PHOTO_BYTES = 3 * 1024 * 1024;
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_TIMEOUT_MS = 60_000;
+const OPEN_LIBRARY_SEARCH_URL = "https://openlibrary.org/search.json";
 const NOTE_TYPES = [
   { id: "photo", label: "Photo", tag: "#photo" },
   { id: "plot", label: "Plot", tag: "#plot" },
@@ -115,6 +124,10 @@ async function route(context: ApiContext): Promise<Response> {
 
   if (parts[0] === "ai" && parts[1] === "topic-action" && method === "POST") {
     return runTopicAiAction(request, env, session);
+  }
+
+  if (parts[0] === "open-library" && parts[1] === "search" && method === "GET") {
+    return openLibrarySearch(request);
   }
 
   if (parts[0] === "rag" && parts[1] === "reindex" && method === "POST") {
@@ -407,6 +420,102 @@ async function createComment(request: Request, db: D1Database, session: Session)
   return json({ id }, 201);
 }
 
+async function openLibrarySearch(request: Request): Promise<Response> {
+  const query = new URL(request.url).searchParams.get("q") || "";
+  const results = await searchOpenLibrary(query, 5);
+  return json({ results });
+}
+
+async function searchOpenLibrary(rawQuery: string, limit = 3): Promise<OpenLibraryBook[]> {
+  const query = rawQuery.trim().replace(/\s+/g, " ").slice(0, 120);
+  if (!query) throw httpError(400, "Search query is required");
+
+  const url = new URL(OPEN_LIBRARY_SEARCH_URL);
+  url.searchParams.set("q", query);
+  url.searchParams.set("limit", String(Math.min(5, Math.max(1, limit))));
+  url.searchParams.set("fields", "key,title,author_name,first_publish_year,cover_i");
+
+  const response = await fetch(url.toString(), {
+    headers: { "Accept": "application/json" },
+  });
+  if (!response.ok) throw httpError(502, "Open Library is temporarily unavailable");
+
+  const data = (await response.json()) as {
+    docs?: Array<{
+      key?: string;
+      title?: string;
+      author_name?: string[];
+      first_publish_year?: number;
+      cover_i?: number;
+    }>;
+  };
+
+  return (data.docs || [])
+    .filter((item) => item.title)
+    .slice(0, limit)
+    .map((item) => {
+      const workKey = item.key || "";
+      const openLibraryUrl = workKey ? `https://openlibrary.org${workKey}` : undefined;
+      const coverUrl = item.cover_i ? `https://covers.openlibrary.org/b/id/${item.cover_i}-M.jpg` : undefined;
+      return {
+        title: String(item.title),
+        authors: Array.isArray(item.author_name) ? item.author_name.slice(0, 3).map(String) : [],
+        firstPublishYear: item.first_publish_year,
+        coverUrl,
+        workKey,
+        openLibraryUrl,
+      };
+    });
+}
+
+function extractOpenLibraryQuery(text: string): string | null {
+  const trimmed = text.trim().replace(/\s+/g, " ");
+  if (!trimmed) return null;
+
+  const direct = trimmed.match(/^(?:open\s*library|найти\s+в\s+open\s*library|найди\s+в\s+open\s*library)\s+(.+)$/iu);
+  if (direct?.[1]) return cleanOpenLibraryQuery(direct[1]);
+
+  const bookSearch = trimmed.match(/^(?:найди|найти|поищи)\s+(?:книгу|book)\s+(.+)$/iu);
+  if (bookSearch?.[1]) return cleanOpenLibraryQuery(bookSearch[1]);
+
+  return null;
+}
+
+function cleanOpenLibraryQuery(value: string): string | null {
+  const query = value.replace(/\s+(?:в\s+)?open\s*library\s*$/iu, "").trim();
+  return query.length >= 2 ? query.slice(0, 120) : null;
+}
+
+async function handleTelegramOpenLibrarySearch(env: Env, chatId: number, text: string): Promise<boolean> {
+  const query = extractOpenLibraryQuery(text);
+  if (!query) return false;
+
+  try {
+    const results = await searchOpenLibrary(query, 3);
+    if (!results.length) {
+      await telegramSend(env, chatId, `Open Library ничего не нашла по запросу: ${query}`);
+      return true;
+    }
+    await telegramSendLong(env, chatId, formatOpenLibraryTelegramResults(query, results));
+  } catch (error) {
+    console.error("Open Library Telegram search failed", error);
+    await telegramSend(env, chatId, "Open Library сейчас недоступна. ѕопробуйте позже, обычные заметки и поиск по пам€ти продолжают работать.");
+  }
+  return true;
+}
+
+function formatOpenLibraryTelegramResults(query: string, results: OpenLibraryBook[]): string {
+  const lines = [`Open Library: результаты по запросу "${query}"`];
+  results.forEach((book, index) => {
+    lines.push("", `${index + 1}. ${book.title}`);
+    if (book.authors.length) lines.push(`Author: ${book.authors.join(", ")}`);
+    if (book.firstPublishYear) lines.push(`First published: ${book.firstPublishYear}`);
+    if (book.openLibraryUrl) lines.push(`Open Library: ${book.openLibraryUrl}`);
+    if (book.coverUrl) lines.push(`Cover: ${book.coverUrl}`);
+  });
+  lines.push("", "Ёто справочна€ карточка. ќна не сохранена в твою пам€ть и не добавлена в RAG.");
+  return lines.join("\n");
+}
 async function runTopicAiAction(request: Request, env: Env, session: Session): Promise<Response> {
   requireOwner(session);
   const body = await readJson<{ topicId?: string; action?: string }>(request);
@@ -1386,6 +1495,9 @@ async function handleTelegramWebhook(request: Request, env: Env, context: ApiCon
   if (message.text) {
     const handledPendingName = await handlePendingStudyBlockName(env, String(userId), message.chat.id, message.text);
     if (handledPendingName) return complete();
+
+    const handledOpenLibrarySearch = await handleTelegramOpenLibrarySearch(env, message.chat.id, message.text);
+    if (handledOpenLibrarySearch) return complete();
 
     const handledMemorySearch = await handleTelegramMemorySearch(env, message.chat.id, message.text);
     if (handledMemorySearch) return complete();
