@@ -654,16 +654,20 @@ function hasRagConfig(env: Env): boolean {
   return Boolean(env.UPSTASH_VECTOR_REST_URL && env.UPSTASH_VECTOR_REST_TOKEN);
 }
 
+function cleanEnvValue(value: string): string {
+  return value.trim().replace(/^['"]|['"]$/g, "");
+}
+
 async function upstashVectorRequest(env: Env, endpoint: string, body: unknown): Promise<unknown> {
   if (!env.UPSTASH_VECTOR_REST_URL || !env.UPSTASH_VECTOR_REST_TOKEN) {
     throw new Error("Upstash Vector is not configured");
   }
 
-  const baseUrl = env.UPSTASH_VECTOR_REST_URL.replace(/\/+$/, "");
+  const baseUrl = cleanEnvValue(env.UPSTASH_VECTOR_REST_URL).replace(/\/+$/, "");
   const response = await fetch(`${baseUrl}/${endpoint}`, {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${env.UPSTASH_VECTOR_REST_TOKEN}`,
+      "Authorization": `Bearer ${cleanEnvValue(env.UPSTASH_VECTOR_REST_TOKEN)}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
