@@ -1,5 +1,3 @@
-import { Index } from "@upstash/vector/cloudflare";
-
 export interface Env {
   DB: D1Database;
   PHOTOS?: R2Bucket;
@@ -20,6 +18,7 @@ type Role = "owner" | "teacher";
 type Session = { role: Role };
 type ApiContext = EventContext<Env, string, unknown>;
 type AiContext = { topicName: string; text: string; fingerprint: string; ragFilter?: string; ragQuery?: string };
+type UpstashVectorResult = { id: string; score?: number; data?: unknown; metadata?: Record<string, unknown> };
 
 const DEFAULT_FOLDERS = ["Books", "Films", "Videos", "Vocabulary", "Inbox"] as const;
 const AI_DAILY_LIMIT = 10;
@@ -512,18 +511,16 @@ async function buildRagEnhancedTopicContext(env: Env, topicId: string, action: s
 }
 
 async function enhanceContextWithRag(env: Env, context: AiContext, query: string): Promise<AiContext> {
-  const index = getRagIndex(env);
-  if (!index || !context.ragFilter) return context;
+  if (!hasRagConfig(env) || !context.ragFilter) return context;
 
   try {
-    const namespace = index.namespace(getRagNamespace(env));
-    const results = (await namespace.query({
+    const results = (await upstashVectorRequest(env, `query-data/${encodeURIComponent(getRagNamespace(env))}`, {
       data: `${query}\n${context.ragQuery || context.topicName}`,
       topK: 10,
       includeData: true,
       includeMetadata: true,
       filter: context.ragFilter,
-    })) as Array<{ id: string; score?: number; data?: unknown; metadata?: Record<string, unknown> }>;
+    })) as UpstashVectorResult[];
 
     const chunks = results
       .filter((result) => String(result.data || "").trim())
@@ -542,16 +539,14 @@ async function enhanceContextWithRag(env: Env, context: AiContext, query: string
     return context;
   }
 }
-
 async function reindexRag(request: Request, env: Env, session: Session): Promise<Response> {
   requireOwner(session);
-  const index = getRagIndex(env);
-  if (!index) return json({ error: "UPSTASH_VECTOR_REST_URL and UPSTASH_VECTOR_REST_TOKEN are not configured" }, 500);
+  if (!hasRagConfig(env)) return json({ error: "UPSTASH_VECTOR_REST_URL and UPSTASH_VECTOR_REST_TOKEN are not configured" }, 500);
 
   let step = "collect";
   try {
     const namespaceName = getRagNamespace(env);
-    const namespace = index.namespace(namespaceName);
+    const namespacePath = encodeURIComponent(namespaceName);
     const rows = await collectRagRows(env.DB);
     const vectors = rows.map((row) => {
       const tags = parseTagsJson(row.tags_json);
@@ -589,10 +584,10 @@ async function reindexRag(request: Request, env: Env, session: Session): Promise
     });
 
     step = "reset";
-    await index.reset({ namespace: namespaceName });
+    await upstashVectorRequest(env, `reset/${namespacePath}`, []);
     step = "upsert";
     for (let indexOffset = 0; indexOffset < vectors.length; indexOffset += 50) {
-      await namespace.upsert(vectors.slice(indexOffset, indexOffset + 50));
+      await upstashVectorRequest(env, `upsert-data/${namespacePath}`, vectors.slice(indexOffset, indexOffset + 50));
     }
 
     return json({ ok: true, namespace: namespaceName, chunks: vectors.length });
@@ -623,11 +618,42 @@ async function collectRagRows(db: D1Database): Promise<RagSourceRow[]> {
   return (result.results || []).filter((row) => row.content.trim());
 }
 
-function getRagIndex(env: Env): Index | null {
-  if (!env.UPSTASH_VECTOR_REST_URL || !env.UPSTASH_VECTOR_REST_TOKEN) return null;
-  return new Index({ url: env.UPSTASH_VECTOR_REST_URL, token: env.UPSTASH_VECTOR_REST_TOKEN });
+function hasRagConfig(env: Env): boolean {
+  return Boolean(env.UPSTASH_VECTOR_REST_URL && env.UPSTASH_VECTOR_REST_TOKEN);
 }
 
+async function upstashVectorRequest(env: Env, endpoint: string, body: unknown): Promise<unknown> {
+  if (!env.UPSTASH_VECTOR_REST_URL || !env.UPSTASH_VECTOR_REST_TOKEN) {
+    throw new Error("Upstash Vector is not configured");
+  }
+
+  const baseUrl = env.UPSTASH_VECTOR_REST_URL.replace(/\/+$/, "");
+  const response = await fetch(`${baseUrl}/${endpoint}`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.UPSTASH_VECTOR_REST_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const text = await response.text();
+  let payload: { result?: unknown; error?: unknown } | null = null;
+  if (text) {
+    try {
+      payload = JSON.parse(text) as { result?: unknown; error?: unknown };
+    } catch {
+      payload = null;
+    }
+  }
+
+  if (!response.ok || payload?.error) {
+    const message = payload?.error ? String(payload.error) : text.slice(0, 300) || response.statusText;
+    throw new Error(`Upstash ${endpoint} failed (${response.status}): ${message}`);
+  }
+
+  return payload && "result" in payload ? payload.result : payload;
+}
 function getRagNamespace(env: Env): string {
   return env.UPSTASH_VECTOR_NAMESPACE || "retelling-brain-bot";
 }
@@ -782,7 +808,7 @@ async function handleTelegramMemorySearch(env: Env, chatId: number, text: string
     return true;
   }
 
-  const context = getRagIndex(env) ? await enhanceContextWithRag(env, scope.context, text) : scope.context;
+  const context = hasRagConfig(env) ? await enhanceContextWithRag(env, scope.context, text) : scope.context;
   if (!context.topicName || context.text.trim().length < 40) {
     await telegramSend(env, chatId, memoryNoDataMessage(text, "выбранной папке или главе"));
     return true;
