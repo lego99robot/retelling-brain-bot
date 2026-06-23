@@ -493,19 +493,19 @@ async function handleTelegramOpenLibrarySearch(env: Env, chatId: number, text: s
   try {
     const results = await searchOpenLibrary(query, 3);
     if (!results.length) {
-      await telegramSend(env, chatId, `Open Library ничего не нашла по запросу: ${query}`);
+      await telegramSend(env, chatId, `Open Library found nothing for: ${query}`);
       return true;
     }
     await telegramSendLong(env, chatId, formatOpenLibraryTelegramResults(query, results));
   } catch (error) {
     console.error("Open Library Telegram search failed", error);
-    await telegramSend(env, chatId, "Open Library сейчас недоступна. ѕопробуйте позже, обычные заметки и поиск по пам€ти продолжают работать.");
+    await telegramSend(env, chatId, "Open Library is temporarily unavailable. Notes and saved-memory search still work as usual.");
   }
   return true;
 }
 
 function formatOpenLibraryTelegramResults(query: string, results: OpenLibraryBook[]): string {
-  const lines = [`Open Library: результаты по запросу "${query}"`];
+  const lines = [`Open Library results for "${query}"`];
   results.forEach((book, index) => {
     lines.push("", `${index + 1}. ${book.title}`);
     if (book.authors.length) lines.push(`Author: ${book.authors.join(", ")}`);
@@ -513,7 +513,7 @@ function formatOpenLibraryTelegramResults(query: string, results: OpenLibraryBoo
     if (book.openLibraryUrl) lines.push(`Open Library: ${book.openLibraryUrl}`);
     if (book.coverUrl) lines.push(`Cover: ${book.coverUrl}`);
   });
-  lines.push("", "Ёто справочна€ карточка. ќна не сохранена в твою пам€ть и не добавлена в RAG.");
+  lines.push("", "Reference only. This was not saved to your memory and was not added to RAG.");
   return lines.join("\n");
 }
 async function runTopicAiAction(request: Request, env: Env, session: Session): Promise<Response> {
