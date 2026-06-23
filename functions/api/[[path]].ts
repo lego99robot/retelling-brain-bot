@@ -19,6 +19,7 @@ type Session = { role: Role };
 type ApiContext = EventContext<Env, string, unknown>;
 type AiContext = { topicName: string; text: string; fingerprint: string; ragFilter?: string; ragQuery?: string };
 type UpstashVectorResult = { id: string; score?: number; data?: unknown; metadata?: Record<string, unknown> };
+type RagReindexOptions = { offset?: unknown; limit?: unknown; reset?: unknown };
 
 const DEFAULT_FOLDERS = ["Books", "Films", "Videos", "Vocabulary", "Inbox"] as const;
 const AI_DAILY_LIMIT = 10;
@@ -543,8 +544,15 @@ async function reindexRag(request: Request, env: Env, session: Session): Promise
   requireOwner(session);
   if (!hasRagConfig(env)) return json({ error: "UPSTASH_VECTOR_REST_URL and UPSTASH_VECTOR_REST_TOKEN are not configured" }, 500);
 
-  let step = "collect";
+  let step = "parse";
   try {
+    const options = await readRagReindexOptions(request);
+    const offset = Math.max(0, Math.floor(Number(options.offset) || 0));
+    const rawLimit = Math.floor(Number(options.limit) || 5);
+    const limit = Math.min(10, Math.max(1, rawLimit));
+    const shouldReset = options.reset === true || (options.reset !== false && offset === 0);
+
+    step = "collect";
     const namespaceName = getRagNamespace(env);
     const namespacePath = encodeURIComponent(namespaceName);
     const rows = await collectRagRows(env.DB);
@@ -583,17 +591,41 @@ async function reindexRag(request: Request, env: Env, session: Session): Promise
       };
     });
 
-    step = "reset";
-    await upstashVectorRequest(env, `reset/${namespacePath}`, []);
-    step = "upsert";
-    for (let indexOffset = 0; indexOffset < vectors.length; indexOffset += 50) {
-      await upstashVectorRequest(env, `upsert-data/${namespacePath}`, vectors.slice(indexOffset, indexOffset + 50));
+    if (shouldReset) {
+      step = "reset";
+      await upstashVectorRequest(env, `reset/${namespacePath}`, []);
     }
 
-    return json({ ok: true, namespace: namespaceName, chunks: vectors.length });
+    const batch = vectors.slice(offset, offset + limit);
+    step = "upsert";
+    if (batch.length) {
+      await upstashVectorRequest(env, `upsert-data/${namespacePath}`, batch);
+    }
+
+    const nextOffset = offset + batch.length;
+    return json({
+      ok: true,
+      namespace: namespaceName,
+      total: vectors.length,
+      offset,
+      limit,
+      indexed: batch.length,
+      nextOffset,
+      done: nextOffset >= vectors.length,
+    });
   } catch (error) {
     console.error("Upstash RAG reindex failed", { step, error });
     return json({ error: "Upstash RAG reindex failed", step, message: error instanceof Error ? error.message : String(error) }, 500);
+  }
+}
+
+async function readRagReindexOptions(request: Request): Promise<RagReindexOptions> {
+  if (!request.headers.get("content-type")?.toLowerCase().includes("application/json")) return {};
+  try {
+    const value = await request.json();
+    return value && typeof value === "object" ? (value as RagReindexOptions) : {};
+  } catch {
+    return {};
   }
 }
 async function collectRagRows(db: D1Database): Promise<RagSourceRow[]> {
