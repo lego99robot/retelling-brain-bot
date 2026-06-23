@@ -615,7 +615,7 @@ async function reindexRag(request: Request, env: Env, session: Session): Promise
     });
   } catch (error) {
     console.error("Upstash RAG reindex failed", { step, error });
-    return json({ error: "Upstash RAG reindex failed", step, message: error instanceof Error ? error.message : String(error) }, 500);
+    return json({ ok: false, error: "Upstash RAG reindex failed", step, message: error instanceof Error ? error.message : String(error) }, 200);
   }
 }
 
