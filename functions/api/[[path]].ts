@@ -818,7 +818,7 @@ function extractSearchKeywords(text: string): string[] {
   const normalized = normalizeSearchText(text);
   const stopWords = new Set([
     "найти", "найди", "ищи", "поиск", "информацию", "информация", "информац", "из", "по", "о", "об", "про", "мне", "дай", "покажи", "расскажи",
-    "глава", "главы", "главе", "главу", "папка", "папке", "книга", "книги", "на", "английском", "русском", "сделай",
+    "глава", "главы", "главе", "главу", "папка", "папке", "книга", "книги", "на", "английском", "русском", "сделай", "уже", "имеющейся",
     "find", "search", "information", "info", "about", "from", "chapter", "chapters", "book", "books", "in", "english", "russian", "tell", "show", "give",
   ]);
   const words = normalized
@@ -827,19 +827,62 @@ function extractSearchKeywords(text: string): string[] {
   const expanded = new Set<string>();
   for (const word of words) {
     expanded.add(word);
-    if (["еда", "еде", "еду", "едой", "пища", "пищу"].includes(word)) {
-      ["food", "eat", "eating", "ate", "meal", "breakfast", "lunch", "dinner", "cake", "hamburger", "hamburgers", "sausage", "sausages"].forEach((item) => expanded.add(item));
-    }
-    if (["змея", "змею", "змее", "змеи"].includes(word)) {
-      ["snake", "reptile", "reptile house"].forEach((item) => expanded.add(normalizeSearchText(item)));
-    }
-    if (["зоопарк", "зоопарке", "зоопарка"].includes(word)) {
-      ["zoo", "reptile house"].forEach((item) => expanded.add(normalizeSearchText(item)));
-    }
+    addKeywordAliases(expanded, word);
   }
-  return [...expanded].filter(Boolean);
+  return [...expanded].map((word) => normalizeSearchText(word)).filter(Boolean);
 }
 
+function addKeywordAliases(expanded: Set<string>, word: string): void {
+  const aliasGroups = [
+    {
+      ru: ["еда", "еде", "еду", "едой", "пища", "пищу"],
+      en: ["food", "eat", "eating", "ate", "meal", "breakfast", "lunch", "dinner", "cake", "hamburger", "hamburgers", "sausage", "sausages"],
+    },
+    {
+      ru: ["змея", "змею", "змее", "змеи"],
+      en: ["snake", "reptile", "reptile house"],
+    },
+    {
+      ru: ["зоопарк", "зоопарке", "зоопарка"],
+      en: ["zoo", "reptile house"],
+    },
+    {
+      ru: ["животное", "животные", "животных", "животными", "кот", "кота", "кошка", "кошку", "кошки", "птица", "птицы", "совы", "сова", "змея", "змею", "змеи"],
+      en: ["animal", "animals", "cat", "cats", "owl", "owls", "bird", "birds", "snake", "snakes", "reptile", "reptile house"],
+    },
+    {
+      ru: ["машина", "машины", "машинах", "авто", "автомобиль", "автомобиле", "машине"],
+      en: ["car", "cars", "drive", "driving", "drove", "route", "work"],
+    },
+    {
+      ru: ["работа", "работе", "работу", "работой", "работы"],
+      en: ["work", "job", "office", "director", "drills", "drive to work", "route"],
+    },
+    {
+      ru: ["эмоция", "эмоции", "эмоциях", "чувство", "чувства", "настроение", "реакция", "реакции"],
+      en: ["emotion", "emotions", "reaction", "reactions", "mood", "proud", "normal", "strange", "shocked", "furious", "scared", "amazed", "surprised", "annoyed", "lonely", "delighted"],
+    },
+    {
+      ru: ["мантия", "мантии", "мантию", "плащ", "плаще", "плаща"],
+      en: ["cloak", "cloaks", "robe", "robes", "mantle"],
+    },
+    {
+      ru: ["семья", "семье", "семью", "родители", "родителях"],
+      en: ["family", "parents", "aunt", "uncle", "cousin", "dursley", "dursleys"],
+    },
+    {
+      ru: ["письмо", "письме", "письма"],
+      en: ["letter", "letters", "envelope", "address"],
+    },
+  ];
+
+  for (const group of aliasGroups) {
+    if (group.ru.includes(word) || group.en.includes(word)) {
+      group.ru.forEach((item) => expanded.add(item));
+      group.en.forEach((item) => expanded.add(item));
+    }
+  }
+}
 function memoryNoDataMessage(text: string, scopeName: string): string {
   const answerInEnglish = /english|английск|на английском|in english/i.test(text);
   return answerInEnglish
@@ -974,6 +1017,9 @@ function parseChapterRange(text: string): { start: number; end: number } | null 
 
   const single = normalized.match(/(?:глав\p{L}*|chapter)\s*(\d+)/u);
   if (single) return normalizeRange(Number(single[1]), Number(single[1]));
+
+  const singleBefore = normalized.match(/(\d+)\s*(?:глав\p{L}*|chapter|chapters)/u);
+  if (singleBefore) return normalizeRange(Number(singleBefore[1]), Number(singleBefore[1]));
 
   const ordinals: Array<[number, string[]]> = [
     [1, ["первая", "первой", "первую", "первую"]],
