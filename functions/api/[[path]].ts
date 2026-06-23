@@ -20,6 +20,7 @@ type ApiContext = EventContext<Env, string, unknown>;
 type AiContext = { topicName: string; text: string; fingerprint: string; ragFilter?: string; ragQuery?: string };
 type UpstashVectorResult = { id: string; score?: number; data?: unknown; metadata?: Record<string, unknown> };
 type RagReindexOptions = { offset?: unknown; limit?: unknown; reset?: unknown };
+type RagVector = { id: string; data: string; metadata: Record<string, unknown> };
 
 const DEFAULT_FOLDERS = ["Books", "Films", "Videos", "Vocabulary", "Inbox"] as const;
 const AI_DAILY_LIMIT = 10;
@@ -98,13 +99,13 @@ async function route(context: ApiContext): Promise<Response> {
   }
 
   if (parts[0] === "notes") {
-    if (method === "POST") return createNote(request, env.DB, session);
-    if (method === "PATCH" && parts[1]) return updateNote(request, env.DB, session, parts[1]);
+    if (method === "POST") return createNote(request, env, session, context);
+    if (method === "PATCH" && parts[1]) return updateNote(request, env, session, parts[1], context);
   }
 
   if (parts[0] === "photos") {
-    if (method === "POST") return createPhoto(request, env, session);
-    if (method === "PATCH" && parts[1]) return updatePhoto(request, env.DB, session, parts[1]);
+    if (method === "POST") return createPhoto(request, env, session, context);
+    if (method === "PATCH" && parts[1]) return updatePhoto(request, env, session, parts[1], context);
     if (method === "GET" && parts[1] && parts[2] === "file") return getPhotoFile(env, parts[1]);
   }
 
@@ -298,35 +299,37 @@ async function getTopicFeed(env: Env, topicId: string): Promise<Response> {
   });
 }
 
-async function createNote(request: Request, db: D1Database, session: Session): Promise<Response> {
+async function createNote(request: Request, env: Env, session: Session, context: ApiContext): Promise<Response> {
   requireOwner(session);
   const body = await readJson<{ topicId?: string; content?: string }>(request);
   if (!body.topicId) return json({ error: "topicId is required" }, 400);
   const content = cleanContent(body.content, NOTE_LIMIT);
   const id = crypto.randomUUID();
-  await db
+  await env.DB
     .prepare("INSERT INTO notes (id, topic_id, author_role, content, tags_json) VALUES (?, ?, ?, ?, ?)")
     .bind(id, body.topicId, "owner", content, JSON.stringify(extractTags(content)))
     .run();
-  await touchTopic(db, body.topicId);
+  await touchTopic(env.DB, body.topicId);
+  queueRagAutoIndex(context, env, "note", id);
   return json({ id }, 201);
 }
 
-async function updateNote(request: Request, db: D1Database, session: Session, noteId: string): Promise<Response> {
+async function updateNote(request: Request, env: Env, session: Session, noteId: string, context: ApiContext): Promise<Response> {
   requireOwner(session);
   const body = await readJson<{ content?: string }>(request);
   const content = cleanContent(body.content, NOTE_LIMIT);
-  const row = await db.prepare("SELECT topic_id FROM notes WHERE id = ?").bind(noteId).first<{ topic_id: string }>();
+  const row = await env.DB.prepare("SELECT topic_id FROM notes WHERE id = ?").bind(noteId).first<{ topic_id: string }>();
   if (!row) return json({ error: "Note not found" }, 404);
-  await db
+  await env.DB
     .prepare("UPDATE notes SET content = ?, tags_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
     .bind(content, JSON.stringify(extractTags(content)), noteId)
     .run();
-  await touchTopic(db, row.topic_id);
+  await touchTopic(env.DB, row.topic_id);
+  queueRagAutoIndex(context, env, "note", noteId);
   return json({ ok: true });
 }
 
-async function createPhoto(request: Request, env: Env, session: Session): Promise<Response> {
+async function createPhoto(request: Request, env: Env, session: Session, context: ApiContext): Promise<Response> {
   requireOwner(session);
   if (!env.PHOTOS) {
     return json({ error: "Photo storage is not configured. Enable R2 to upload photos from the web panel." }, 503);
@@ -353,23 +356,24 @@ async function createPhoto(request: Request, env: Env, session: Session): Promis
     .bind(id, topicId, r2Key, safeFilename(file.name || `${id}.jpg`), "image/jpeg", file.size, description, JSON.stringify(extractTags(description)))
     .run();
   await touchTopic(env.DB, topicId);
+  queueRagAutoIndex(context, env, "photo", id);
   return json({ id }, 201);
 }
 
-async function updatePhoto(request: Request, db: D1Database, session: Session, photoId: string): Promise<Response> {
+async function updatePhoto(request: Request, env: Env, session: Session, photoId: string, context: ApiContext): Promise<Response> {
   requireOwner(session);
   const body = await readJson<{ description?: string }>(request);
   const description = String(body.description || "").trim().slice(0, NOTE_LIMIT);
-  const row = await db.prepare("SELECT topic_id FROM photos WHERE id = ?").bind(photoId).first<{ topic_id: string }>();
+  const row = await env.DB.prepare("SELECT topic_id FROM photos WHERE id = ?").bind(photoId).first<{ topic_id: string }>();
   if (!row) return json({ error: "Photo not found" }, 404);
-  await db
+  await env.DB
     .prepare("UPDATE photos SET description = ?, tags_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
     .bind(description, JSON.stringify(extractTags(description)), photoId)
     .run();
-  await touchTopic(db, row.topic_id);
+  await touchTopic(env.DB, row.topic_id);
+  queueRagAutoIndex(context, env, "photo", photoId);
   return json({ ok: true });
 }
-
 async function getPhotoFile(env: Env, photoId: string): Promise<Response> {
   const photo = await env.DB.prepare("SELECT r2_key, content_type FROM photos WHERE id = ?").bind(photoId).first<{ r2_key: string; content_type: string }>();
   if (!photo) return json({ error: "Photo not found" }, 404);
@@ -627,6 +631,91 @@ async function readRagReindexOptions(request: Request): Promise<RagReindexOption
   } catch {
     return {};
   }
+}
+function ragVectorFromRow(row: RagSourceRow): RagVector {
+  const tags = parseTagsJson(row.tags_json);
+  const noteType = inferNoteTypeFromTags(tags);
+  const book = bookTitleFromStudyBlock(row.topic_name) || row.topic_name;
+  const chapter = extractChapterNumber(row.topic_name);
+  const data = [
+    `Folder: ${row.folder_name}`,
+    `Book: ${book}`,
+    `Study block: ${row.topic_name}`,
+    chapter ? `Chapter: ${chapter}` : "",
+    `Type: ${noteType}`,
+    row.content,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return {
+    id: `${row.source_type}:${row.source_id}`,
+    data,
+    metadata: {
+      folder: row.folder_name,
+      folderId: row.folder_id,
+      book,
+      studyBlock: row.topic_name,
+      topicId: row.topic_id,
+      chapter,
+      noteType,
+      tags,
+      sourceType: row.source_type,
+      sourceId: row.source_id,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    },
+  };
+}
+
+function queueRagAutoIndex(context: ApiContext, env: Env, sourceType: "note" | "photo", sourceId: string): void {
+  if (!hasRagConfig(env)) return;
+  context.waitUntil(
+    autoIndexRagSource(env, sourceType, sourceId).catch((error) => {
+      console.error("RAG auto-index failed", { sourceType, sourceId, error });
+    }),
+  );
+}
+
+async function autoIndexRagSource(env: Env, sourceType: "note" | "photo", sourceId: string): Promise<void> {
+  const row = await getRagSourceRow(env.DB, sourceType, sourceId);
+  if (!row) {
+    await deleteRagVector(env, `${sourceType}:${sourceId}`);
+    return;
+  }
+  await upstashVectorRequest(env, `upsert-data/${encodeURIComponent(getRagNamespace(env))}`, [ragVectorFromRow(row)]);
+}
+
+async function deleteRagVector(env: Env, vectorId: string): Promise<void> {
+  if (!hasRagConfig(env)) return;
+  await upstashVectorRequest(env, `delete/${encodeURIComponent(getRagNamespace(env))}`, { ids: [vectorId] });
+}
+
+async function getRagSourceRow(db: D1Database, sourceType: "note" | "photo", sourceId: string): Promise<RagSourceRow | null> {
+  if (sourceType === "note") {
+    return db
+      .prepare(
+        `SELECT 'note' AS source_type, n.id AS source_id, n.content AS content, n.tags_json,
+          n.created_at AS created_at, n.updated_at AS updated_at, t.id AS topic_id, t.name AS topic_name, f.id AS folder_id, f.name AS folder_name
+         FROM notes n
+         JOIN topics t ON t.id = n.topic_id
+         JOIN folders f ON f.id = t.folder_id
+         WHERE n.id = ? AND f.name = 'Books'`,
+      )
+      .bind(sourceId)
+      .first<RagSourceRow>();
+  }
+
+  return db
+    .prepare(
+      `SELECT 'photo' AS source_type, p.id AS source_id, p.description AS content, p.tags_json,
+        p.created_at AS created_at, p.updated_at AS updated_at, t.id AS topic_id, t.name AS topic_name, f.id AS folder_id, f.name AS folder_name
+       FROM photos p
+       JOIN topics t ON t.id = p.topic_id
+       JOIN folders f ON f.id = t.folder_id
+       WHERE p.id = ? AND f.name = 'Books' AND p.description <> ''`,
+    )
+    .bind(sourceId)
+    .first<RagSourceRow>();
 }
 async function collectRagRows(db: D1Database): Promise<RagSourceRow[]> {
   const result = await db
@@ -1272,7 +1361,7 @@ async function handleTelegramWebhook(request: Request, env: Env, context: ApiCon
 
   try {
   if (update.callback_query) {
-    await handleTelegramCallback(env, update.callback_query, String(userId));
+    await handleTelegramCallback(env, update.callback_query, String(userId), context);
     return complete();
   }
 
@@ -1397,7 +1486,7 @@ async function setTelegramWebhook(request: Request, env: Env): Promise<Response>
   return json({ ok: true, webhookUrl, description: data.description || "Webhook was set" });
 }
 
-async function handleTelegramCallback(env: Env, callback: TelegramCallbackQuery, userId: string): Promise<void> {
+async function handleTelegramCallback(env: Env, callback: TelegramCallbackQuery, userId: string, context: ApiContext): Promise<void> {
   const data = callback.data || "";
   const [kind, draftId, selectedId] = data.split(":");
 
@@ -1461,7 +1550,7 @@ async function handleTelegramCallback(env: Env, callback: TelegramCallbackQuery,
       return;
     }
     await telegramAnswerCallback(env, callback.id, "Сохраняю...");
-    await saveDraftAsStudyMaterial(env, draft, noteType.tag);
+    await saveDraftAsStudyMaterial(env, draft, noteType.tag, context);
     await env.DB.prepare("UPDATE telegram_drafts SET note_type = ? WHERE id = ?").bind(noteType.id, draftId).run();
     await env.DB.prepare("DELETE FROM telegram_drafts WHERE id = ?").bind(draftId).run();
     const topic = await env.DB
@@ -1582,24 +1671,26 @@ async function handlePendingStudyBlockName(env: Env, userId: string, chatId: num
   return true;
 }
 
-async function saveDraftAsStudyMaterial(env: Env, draft: TelegramDraft, typeTag: string): Promise<void> {
+async function saveDraftAsStudyMaterial(env: Env, draft: TelegramDraft, typeTag: string, context: ApiContext): Promise<void> {
   if (!draft.selected_topic_id) throw new Error("Missing selected study block");
 
   if (draft.kind === "text" && draft.text_content) {
     const content = withTypeTag(draft.text_content, typeTag);
+    const noteId = crypto.randomUUID();
     await env.DB
       .prepare("INSERT INTO notes (id, topic_id, author_role, content, tags_json) VALUES (?, ?, 'owner', ?, ?)")
-      .bind(crypto.randomUUID(), draft.selected_topic_id, content, JSON.stringify(extractTags(content)))
+      .bind(noteId, draft.selected_topic_id, content, JSON.stringify(extractTags(content)))
       .run();
+    queueRagAutoIndex(context, env, "note", noteId);
   }
 
   if (draft.kind === "photo" && draft.telegram_file_id) {
-    await saveTelegramPhoto(env, draft.selected_topic_id, draft.telegram_file_id, withTypeTag(draft.text_content || "", typeTag));
+    const photoId = await saveTelegramPhoto(env, draft.selected_topic_id, draft.telegram_file_id, withTypeTag(draft.text_content || "", typeTag));
+    queueRagAutoIndex(context, env, "photo", photoId);
   }
 
   await touchTopic(env.DB, draft.selected_topic_id);
 }
-
 async function getTelegramDraft(env: Env, draftId: string, userId: string): Promise<TelegramDraft | null> {
   return env.DB.prepare("SELECT * FROM telegram_drafts WHERE id = ? AND telegram_user_id = ?").bind(draftId, userId).first<TelegramDraft>();
 }
@@ -1633,7 +1724,7 @@ async function sendFolderPicker(env: Env, chatId: number, draftId: string): Prom
   await telegramSend(env, chatId, "Шаг 1 из 3. Куда сохранить?", rows);
 }
 
-async function saveTelegramPhoto(env: Env, topicId: string, fileId: string, description = ""): Promise<void> {
+async function saveTelegramPhoto(env: Env, topicId: string, fileId: string, description = ""): Promise<string> {
   const id = crypto.randomUUID();
   const tagsJson = JSON.stringify(extractTags(description));
 
@@ -1645,7 +1736,7 @@ async function saveTelegramPhoto(env: Env, topicId: string, fileId: string, desc
       )
       .bind(id, topicId, `telegram:${fileId}`, `${id}.jpg`, description, tagsJson)
       .run();
-    return;
+    return id;
   }
 
   const bytes = await downloadTelegramPhoto(env, fileId);
@@ -1658,8 +1749,8 @@ async function saveTelegramPhoto(env: Env, topicId: string, fileId: string, desc
     )
     .bind(id, topicId, r2Key, `${id}.jpg`, bytes.byteLength, description, tagsJson)
     .run();
+  return id;
 }
-
 async function getTelegramPhotoFile(env: Env, fileId: string): Promise<Response> {
   const bytes = await downloadTelegramPhoto(env, fileId);
   return new Response(bytes, {
