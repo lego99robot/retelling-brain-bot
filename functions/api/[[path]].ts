@@ -632,14 +632,14 @@ async function collectRagRows(db: D1Database): Promise<RagSourceRow[]> {
   const result = await db
     .prepare(
       `SELECT 'note' AS source_type, n.id AS source_id, n.content AS content, n.tags_json,
-        n.created_at, n.updated_at, t.id AS topic_id, t.name AS topic_name, f.id AS folder_id, f.name AS folder_name
+        n.created_at AS created_at, n.updated_at AS updated_at, t.id AS topic_id, t.name AS topic_name, f.id AS folder_id, f.name AS folder_name
        FROM notes n
        JOIN topics t ON t.id = n.topic_id
        JOIN folders f ON f.id = t.folder_id
        WHERE f.name = 'Books'
        UNION ALL
        SELECT 'photo' AS source_type, p.id AS source_id, p.description AS content, p.tags_json,
-        p.created_at, p.updated_at, t.id AS topic_id, t.name AS topic_name, f.id AS folder_id, f.name AS folder_name
+        p.created_at AS created_at, p.updated_at AS updated_at, t.id AS topic_id, t.name AS topic_name, f.id AS folder_id, f.name AS folder_name
        FROM photos p
        JOIN topics t ON t.id = p.topic_id
        JOIN folders f ON f.id = t.folder_id
