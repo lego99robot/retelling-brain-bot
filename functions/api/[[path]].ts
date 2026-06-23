@@ -1,4 +1,4 @@
-import { Index } from "@upstash/vector";
+import { Index } from "@upstash/vector/cloudflare";
 
 export interface Env {
   DB: D1Database;
