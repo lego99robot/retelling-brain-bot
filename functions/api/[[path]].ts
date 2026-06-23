@@ -775,7 +775,7 @@ async function handleTelegramMemorySearch(env: Env, chatId: number, text: string
     return true;
   }
 
-  const context = scope.context;
+  const context = getRagIndex(env) ? await enhanceContextWithRag(env, scope.context, text) : scope.context;
   if (!context.topicName || context.text.trim().length < 40) {
     await telegramSend(env, chatId, memoryNoDataMessage(text, "выбранной папке или главе"));
     return true;
@@ -784,10 +784,7 @@ async function handleTelegramMemorySearch(env: Env, chatId: number, text: string
   const entries = extractMemoryEntries(context.text);
   const keywords = extractSearchKeywords(text);
   const matches = keywords.length
-    ? entries.filter((entry) => {
-        const normalized = normalizeSearchText(entry);
-        return keywords.some((keyword) => normalized.includes(keyword));
-      })
+    ? entries.filter((entry) => memoryEntryMatchesKeywords(entry, keywords))
     : entries;
 
   if (!matches.length) {
@@ -806,14 +803,45 @@ async function handleTelegramMemorySearch(env: Env, chatId: number, text: string
 }
 
 function extractMemoryEntries(contextText: string): string[] {
-  return contextText
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.startsWith("Note:") || line.startsWith("Photo description:"))
-    .map((line) => line.replace(/^(Note:|Photo description:)\s*/i, "").trim())
-    .filter(Boolean);
+  const entries: string[] = [];
+
+  for (const block of contextText.split(/\n\n+/)) {
+    const trimmed = block.trim();
+    if (!trimmed) continue;
+
+    if (trimmed.startsWith("RAG chunk")) {
+      const withoutHeader = trimmed.replace(/^RAG chunk \d+(?: \([^)]*\))?:\s*/i, "").trim();
+      const content = withoutHeader
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line && !/^(Folder|Book|Study block|Chapter|Type):/i.test(line))
+        .join(" ")
+        .trim();
+      if (content) entries.push(content);
+      continue;
+    }
+
+    for (const line of trimmed.split("\n")) {
+      const cleaned = line.trim();
+      if (cleaned.startsWith("Note:") || cleaned.startsWith("Photo description:")) {
+        entries.push(cleaned.replace(/^(Note:|Photo description:)\s*/i, "").trim());
+      }
+    }
+  }
+
+  return [...new Set(entries.filter(Boolean))];
 }
 
+function memoryEntryMatchesKeywords(entry: string, keywords: string[]): boolean {
+  const normalized = normalizeSearchText(entry);
+  const tokens = new Set(normalized.split(" ").filter(Boolean));
+  return keywords.some((keyword) => {
+    const normalizedKeyword = normalizeSearchText(keyword);
+    if (!normalizedKeyword) return false;
+    if (normalizedKeyword.includes(" ")) return normalized.includes(normalizedKeyword);
+    return tokens.has(normalizedKeyword);
+  });
+}
 function extractSearchKeywords(text: string): string[] {
   const normalized = normalizeSearchText(text);
   const stopWords = new Set([
